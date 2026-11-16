@@ -1218,6 +1218,22 @@ fn decode_wrapper_bytes(buf: &[u8]) -> Result<(Vec<u8>, bool), prost::DecodeErro
 // Macro for flush/finish boilerplate
 // ---------------------------------------------------------------------------
 
+/// Appends `value`, or replaces the value appended earlier in this row when
+/// the field occurs again (`has_value`).
+#[inline(always)]
+fn push_or_replace<T: ArrowPrimitiveType>(
+    builder: &mut PrimitiveBuilder<T>,
+    value: T::Native,
+    has_value: &mut bool,
+) {
+    if *has_value {
+        *builder.values_slice_mut().last_mut().unwrap() = value;
+    } else {
+        builder.append_value(value);
+        *has_value = true;
+    }
+}
+
 macro_rules! flush_primitive {
     ($value:expr, $has_value:expr, $has_presence:expr, $builder:expr, $default:expr) => {
         if *$has_value {
@@ -1307,20 +1323,22 @@ fn finish_time_of_day(builder: &mut PrimitiveBuilder<Int64Type>, unit: TimeUnit)
 // ---------------------------------------------------------------------------
 
 impl FieldDecoder {
-    fn decode(&mut self, wire_type: u8, buf: &[u8]) -> Result<usize, prost::DecodeError> {
+    /// Decodes one occurrence of this field. Singular numbers, enum numbers,
+    /// strings and bytes are appended directly and set `has_value`; a repeat in
+    /// the same row replaces the value. Other fields leave `has_value` alone.
+    fn decode(
+        &mut self,
+        wire_type: u8,
+        buf: &[u8],
+        has_value: &mut bool,
+    ) -> Result<usize, prost::DecodeError> {
         match self {
-            Self::Int32 {
-                value, has_value, ..
-            }
-            | Self::EnumInt32 {
-                value, has_value, ..
-            } => {
+            Self::Int32 { builder, .. } | Self::EnumInt32 { builder, .. } => {
                 if wire_type != 0 {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                *value = v as i32;
-                *has_value = true;
+                push_or_replace(builder, v as i32, has_value);
                 Ok(n)
             }
             Self::EnumString {
@@ -1337,137 +1355,128 @@ impl FieldDecoder {
                 *has_value = true;
                 Ok(n)
             }
-            Self::Int64 {
-                value, has_value, ..
-            } => {
+            Self::Int64 { builder, .. } => {
                 if wire_type != 0 {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                *value = v as i64;
-                *has_value = true;
+                push_or_replace(builder, v as i64, has_value);
                 Ok(n)
             }
-            Self::UInt32 {
-                value, has_value, ..
-            } => {
+            Self::UInt32 { builder, .. } => {
                 if wire_type != 0 {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                *value = v as u32;
-                *has_value = true;
+                push_or_replace(builder, v as u32, has_value);
                 Ok(n)
             }
-            Self::UInt64 {
-                value, has_value, ..
-            } => {
+            Self::UInt64 { builder, .. } => {
                 if wire_type != 0 {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                *value = v;
-                *has_value = true;
+                push_or_replace(builder, v, has_value);
                 Ok(n)
             }
-            Self::Sint32 {
-                value, has_value, ..
-            } => {
+            Self::Sint32 { builder, .. } => {
                 if wire_type != 0 {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                *value = decode_zigzag32(v);
-                *has_value = true;
+                push_or_replace(builder, decode_zigzag32(v), has_value);
                 Ok(n)
             }
-            Self::Sint64 {
-                value, has_value, ..
-            } => {
+            Self::Sint64 { builder, .. } => {
                 if wire_type != 0 {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                *value = decode_zigzag64(v);
-                *has_value = true;
+                push_or_replace(builder, decode_zigzag64(v), has_value);
                 Ok(n)
             }
-            Self::Sfixed32 {
-                value, has_value, ..
-            } => {
+            Self::Sfixed32 { builder, .. } => {
                 if wire_type != 5 {
                     return skip_field(wire_type, buf);
                 }
                 if buf.len() < 4 {
                     return Err(decode_error("unexpected EOF"));
                 }
-                *value = i32::from_le_bytes(buf[..4].try_into().unwrap());
-                *has_value = true;
+                push_or_replace(
+                    builder,
+                    i32::from_le_bytes(buf[..4].try_into().unwrap()),
+                    has_value,
+                );
                 Ok(4)
             }
-            Self::Sfixed64 {
-                value, has_value, ..
-            } => {
+            Self::Sfixed64 { builder, .. } => {
                 if wire_type != 1 {
                     return skip_field(wire_type, buf);
                 }
                 if buf.len() < 8 {
                     return Err(decode_error("unexpected EOF"));
                 }
-                *value = i64::from_le_bytes(buf[..8].try_into().unwrap());
-                *has_value = true;
+                push_or_replace(
+                    builder,
+                    i64::from_le_bytes(buf[..8].try_into().unwrap()),
+                    has_value,
+                );
                 Ok(8)
             }
-            Self::Fixed32 {
-                value, has_value, ..
-            } => {
+            Self::Fixed32 { builder, .. } => {
                 if wire_type != 5 {
                     return skip_field(wire_type, buf);
                 }
                 if buf.len() < 4 {
                     return Err(decode_error("unexpected EOF"));
                 }
-                *value = u32::from_le_bytes(buf[..4].try_into().unwrap());
-                *has_value = true;
+                push_or_replace(
+                    builder,
+                    u32::from_le_bytes(buf[..4].try_into().unwrap()),
+                    has_value,
+                );
                 Ok(4)
             }
-            Self::Fixed64 {
-                value, has_value, ..
-            } => {
+            Self::Fixed64 { builder, .. } => {
                 if wire_type != 1 {
                     return skip_field(wire_type, buf);
                 }
                 if buf.len() < 8 {
                     return Err(decode_error("unexpected EOF"));
                 }
-                *value = u64::from_le_bytes(buf[..8].try_into().unwrap());
-                *has_value = true;
+                push_or_replace(
+                    builder,
+                    u64::from_le_bytes(buf[..8].try_into().unwrap()),
+                    has_value,
+                );
                 Ok(8)
             }
-            Self::Float {
-                value, has_value, ..
-            } => {
+            Self::Float { builder, .. } => {
                 if wire_type != 5 {
                     return skip_field(wire_type, buf);
                 }
                 if buf.len() < 4 {
                     return Err(decode_error("unexpected EOF"));
                 }
-                *value = f32::from_le_bytes(buf[..4].try_into().unwrap());
-                *has_value = true;
+                push_or_replace(
+                    builder,
+                    f32::from_le_bytes(buf[..4].try_into().unwrap()),
+                    has_value,
+                );
                 Ok(4)
             }
-            Self::Double {
-                value, has_value, ..
-            } => {
+            Self::Double { builder, .. } => {
                 if wire_type != 1 {
                     return skip_field(wire_type, buf);
                 }
                 if buf.len() < 8 {
                     return Err(decode_error("unexpected EOF"));
                 }
-                *value = f64::from_le_bytes(buf[..8].try_into().unwrap());
-                *has_value = true;
+                push_or_replace(
+                    builder,
+                    f64::from_le_bytes(buf[..8].try_into().unwrap()),
+                    has_value,
+                );
                 Ok(8)
             }
             Self::Bool {
@@ -1725,20 +1734,24 @@ impl FieldDecoder {
                 let (data, total) = read_length_delimited(buf)?;
                 // Parse entry submessage: field 1 = key, field 2 = value
                 let mut pos = 0;
+                let (mut key_seen, mut value_seen) = (false, false);
                 while pos < data.len() {
                     let (fnum, wt, n) = decode_tag(&data[pos..])?;
                     pos += n;
                     if fnum == 1 {
-                        pos += key_decoder.decode(wt, &data[pos..])?;
+                        pos += key_decoder.decode(wt, &data[pos..], &mut key_seen)?;
                     } else if fnum == 2 {
-                        pos += value_decoder.decode(wt, &data[pos..])?;
+                        pos += value_decoder.decode(wt, &data[pos..], &mut value_seen)?;
                     } else {
                         pos += skip_field(wt, &data[pos..])?;
                     }
                 }
-                // Flush key and value (they're buffered singular decoders)
-                key_decoder.flush();
-                value_decoder.flush();
+                if !key_seen {
+                    key_decoder.flush();
+                }
+                if !value_seen {
+                    value_decoder.flush();
+                }
                 Ok(total)
             }
         }
@@ -2382,8 +2395,18 @@ fn decode_repeated_wrapper_fixed64<T: ArrowPrimitiveType>(
 // MessageDecoder
 // ---------------------------------------------------------------------------
 
+/// One field of a [`MessageDecoder`].
+struct DecoderState {
+    decoder: FieldDecoder,
+    field: FieldDescriptor,
+    /// The decoder appended its value directly in the current row (see
+    /// [`FieldDecoder::decode`]).
+    has_value: bool,
+}
+
 pub struct MessageDecoder {
-    decoders: Vec<(FieldDecoder, FieldDescriptor)>,
+    /// One per field, in field order.
+    decoders: Vec<DecoderState>,
     tag_map: Vec<Option<usize>>,
     list_nullable: bool,
     map_nullable: bool,
@@ -2415,7 +2438,11 @@ impl MessageDecoder {
                 if field.number() > max_field_number {
                     max_field_number = field.number();
                 }
-                decoders.push((decoder, field));
+                decoders.push(DecoderState {
+                    decoder,
+                    field,
+                    has_value: false,
+                });
             }
         }
         ancestors.pop();
@@ -2428,7 +2455,7 @@ impl MessageDecoder {
                 max_field_number as usize + 1
             }
         ];
-        for (idx, (_, field)) in decoders.iter().enumerate() {
+        for (idx, DecoderState { field, .. }) in decoders.iter().enumerate() {
             let num = field.number() as usize;
             tag_map[num] = Some(idx);
         }
@@ -2453,14 +2480,15 @@ impl MessageDecoder {
                 None
             };
             if let Some(idx) = idx {
-                pos += self.decoders[idx].0.decode(wire_type, &buf[pos..])?;
+                let DecoderState {
+                    decoder, has_value, ..
+                } = &mut self.decoders[idx];
+                pos += decoder.decode(wire_type, &buf[pos..], has_value)?;
             } else {
                 pos += skip_field(wire_type, &buf[pos..])?;
             }
         }
-        for (decoder, _) in &mut self.decoders {
-            decoder.flush();
-        }
+        self.flush_unseen();
         self.num_rows += 1;
         Ok(())
     }
@@ -2478,7 +2506,10 @@ impl MessageDecoder {
                 None
             };
             if let Some(idx) = idx {
-                pos += self.decoders[idx].0.decode(wire_type, &buf[pos..])?;
+                let DecoderState {
+                    decoder, has_value, ..
+                } = &mut self.decoders[idx];
+                pos += decoder.decode(wire_type, &buf[pos..], has_value)?;
             } else {
                 pos += skip_field(wire_type, &buf[pos..])?;
             }
@@ -2486,22 +2517,30 @@ impl MessageDecoder {
         Ok(())
     }
 
-    fn flush_row(&mut self) {
-        for (decoder, _) in &mut self.decoders {
-            decoder.flush();
+    /// Ends a row: flushes every decoder that did not append its value
+    /// directly (see [`FieldDecoder::decode`]) and clears `has_value`.
+    fn flush_unseen(&mut self) {
+        for DecoderState {
+            decoder, has_value, ..
+        } in &mut self.decoders
+        {
+            if !*has_value {
+                decoder.flush();
+            }
+            *has_value = false;
         }
+    }
+
+    fn flush_row(&mut self) {
+        self.flush_unseen();
     }
 
     fn flush_defaults(&mut self) {
-        for (decoder, _) in &mut self.decoders {
-            decoder.flush(); // all absent → defaults
-        }
+        self.flush_unseen(); // all absent → defaults
     }
 
     fn decode_null_row(&mut self) {
-        for (decoder, _) in &mut self.decoders {
-            decoder.flush();
-        }
+        self.flush_unseen();
         self.num_rows += 1;
     }
 
@@ -2521,18 +2560,24 @@ impl MessageDecoder {
         let (fields, columns): (Vec<_>, Vec<_>) = self
             .decoders
             .iter_mut()
-            .map(|(decoder, field_desc)| {
-                let nullable = if field_desc.is_list() {
-                    self.list_nullable
-                } else if field_desc.is_map() {
-                    self.map_nullable
-                } else {
-                    field_desc.supports_presence()
-                };
-                let (_, array) = decoder.finish(nullable);
-                let field = Field::new(field_desc.name(), array.data_type().clone(), nullable);
-                (field, array)
-            })
+            .map(
+                |DecoderState {
+                     decoder,
+                     field: field_desc,
+                     ..
+                 }| {
+                    let nullable = if field_desc.is_list() {
+                        self.list_nullable
+                    } else if field_desc.is_map() {
+                        self.map_nullable
+                    } else {
+                        field_desc.supports_presence()
+                    };
+                    let (_, array) = decoder.finish(nullable);
+                    let field = Field::new(field_desc.name(), array.data_type().clone(), nullable);
+                    (field, array)
+                },
+            )
             .unzip();
 
         StructArray::new(
