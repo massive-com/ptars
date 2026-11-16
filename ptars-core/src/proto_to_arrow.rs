@@ -22,7 +22,7 @@ use crate::config::{ConfluentWirePolicy, EnumRepr, PtarsConfig};
 
 mod column_builder;
 
-use column_builder::validate_utf8;
+use column_builder::{validate_utf8, ByteColumn, StringColumn};
 
 // ---------------------------------------------------------------------------
 // Wire format decoding primitives
@@ -276,9 +276,6 @@ impl StringBuilderInner {
             Self::Large(b) => b.append_null(),
         }
     }
-    fn append_default(&mut self) {
-        self.append_value("");
-    }
     fn finish(&mut self) -> Arc<dyn Array> {
         match self {
             Self::Regular(b) => Arc::new(std::mem::take(b).finish()),
@@ -317,9 +314,6 @@ impl BinaryBuilderInner {
             Self::Regular(b) => b.append_null(),
             Self::Large(b) => b.append_null(),
         }
-    }
-    fn append_default(&mut self) {
-        self.append_value(b"");
     }
     fn finish(&mut self) -> Arc<dyn Array> {
         match self {
@@ -954,16 +948,12 @@ enum FieldDecoder {
         builder: BooleanBuilder,
     },
     String {
-        value: Vec<u8>,
-        has_value: bool,
         has_presence: bool,
-        builder: StringBuilderInner,
+        builder: StringColumn,
     },
     Bytes {
-        value: Vec<u8>,
-        has_value: bool,
         has_presence: bool,
-        builder: BinaryBuilderInner,
+        builder: ByteColumn,
     },
     EnumInt32 {
         value: i32,
@@ -1494,29 +1484,20 @@ impl FieldDecoder {
                 *has_value = true;
                 Ok(n)
             }
-            Self::String {
-                value, has_value, ..
-            } => {
+            Self::String { builder, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                validate_utf8(data)?;
-                value.clear();
-                value.extend_from_slice(data);
-                *has_value = true;
+                builder.push_or_replace(validate_utf8(data)?, has_value);
                 Ok(total)
             }
-            Self::Bytes {
-                value, has_value, ..
-            } => {
+            Self::Bytes { builder, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                value.clear();
-                value.extend_from_slice(data);
-                *has_value = true;
+                builder.push_or_replace(data, has_value);
                 Ok(total)
             }
             // Well-known types: decode submessage
@@ -1926,37 +1907,26 @@ impl FieldDecoder {
                 *has_value = false;
                 *value = false;
             }
+            // Appended in decode; flushed only when absent from the row.
             Self::String {
-                value,
-                has_value,
                 has_presence,
                 builder,
             } => {
-                if *has_value {
-                    builder.append_value(unsafe { std::str::from_utf8_unchecked(value) });
-                } else if *has_presence {
-                    builder.append_null();
+                if *has_presence {
+                    builder.push_null();
                 } else {
-                    builder.append_default();
+                    builder.push("");
                 }
-                *has_value = false;
-                value.clear();
             }
             Self::Bytes {
-                value,
-                has_value,
                 has_presence,
                 builder,
             } => {
-                if *has_value {
-                    builder.append_value(value.as_slice());
-                } else if *has_presence {
-                    builder.append_null();
+                if *has_presence {
+                    builder.push_null();
                 } else {
-                    builder.append_default();
+                    builder.push(b"");
                 }
-                *has_value = false;
-                value.clear();
             }
             // Well-known types
             Self::Timestamp {
@@ -2216,8 +2186,10 @@ impl FieldDecoder {
             Self::Float { builder, .. } => finish_primitive(builder),
             Self::Double { builder, .. } => finish_primitive(builder),
             Self::Bool { builder, .. } => Arc::new(std::mem::take(builder).finish()),
-            Self::String { builder, .. } | Self::EnumString { builder, .. } => builder.finish(),
-            Self::Bytes { builder, .. } | Self::EnumBinary { builder, .. } => builder.finish(),
+            Self::String { builder, .. } => builder.finish(),
+            Self::EnumString { builder, .. } => builder.finish(),
+            Self::Bytes { builder, .. } => builder.finish(),
+            Self::EnumBinary { builder, .. } => builder.finish(),
             Self::Timestamp {
                 builder, unit, tz, ..
             } => finish_timestamp(builder, *unit, tz),
@@ -2703,16 +2675,12 @@ fn build_field_decoder(
             builder: BooleanBuilder::new(),
         }),
         Kind::String => Some(FieldDecoder::String {
-            value: Vec::new(),
-            has_value: false,
             has_presence,
-            builder: StringBuilderInner::new(config.use_large_string),
+            builder: StringColumn::new(config.use_large_string),
         }),
         Kind::Bytes => Some(FieldDecoder::Bytes {
-            value: Vec::new(),
-            has_value: false,
             has_presence,
-            builder: BinaryBuilderInner::new(config.use_large_binary),
+            builder: ByteColumn::new(config.use_large_binary),
         }),
         Kind::Enum(enum_desc) => match config.enum_repr {
             EnumRepr::Int32 => Some(FieldDecoder::EnumInt32 {
@@ -2827,10 +2795,8 @@ fn build_message_field_decoder(
             // decodes as its raw bytes (see MessageDecoder::new_inner).
             if ancestors.iter().any(|a| a == msg_desc.full_name()) {
                 return Some(FieldDecoder::Bytes {
-                    value: Vec::new(),
-                    has_value: false,
                     has_presence: true,
-                    builder: BinaryBuilderInner::new(config.use_large_binary),
+                    builder: ByteColumn::new(config.use_large_binary),
                 });
             }
             let sub_decoder = MessageDecoder::new_inner(&msg_desc, config, ancestors);
@@ -3117,16 +3083,12 @@ fn build_singular_decoder_for_map(
             builder: BooleanBuilder::new(),
         }),
         Kind::String => Some(FieldDecoder::String {
-            value: Vec::new(),
-            has_value: false,
             has_presence: false,
-            builder: StringBuilderInner::new(config.use_large_string),
+            builder: StringColumn::new(config.use_large_string),
         }),
         Kind::Bytes => Some(FieldDecoder::Bytes {
-            value: Vec::new(),
-            has_value: false,
             has_presence: false,
-            builder: BinaryBuilderInner::new(config.use_large_binary),
+            builder: ByteColumn::new(config.use_large_binary),
         }),
         Kind::Enum(enum_desc) => match config.enum_repr {
             EnumRepr::Int32 => Some(FieldDecoder::EnumInt32 {
