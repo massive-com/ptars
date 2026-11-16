@@ -287,10 +287,17 @@ struct ByteColumn {
 
 impl ByteColumn {
     fn new(large: bool) -> Self {
+        Self::with_capacity(large, 0)
+    }
+
+    /// Room for `rows` rows; the value bytes still grow as needed.
+    fn with_capacity(large: bool, rows: usize) -> Self {
+        let mut offsets = Vec::with_capacity(rows + 1);
+        offsets.push(0);
         Self {
-            offsets: vec![0],
+            offsets,
             values: Vec::new(),
-            nulls: NullBufferBuilder::new(0),
+            nulls: NullBufferBuilder::new(rows),
             large,
         }
     }
@@ -359,6 +366,10 @@ struct StringColumn(ByteColumn);
 impl StringColumn {
     fn new(large: bool) -> Self {
         Self(ByteColumn::new(large))
+    }
+
+    fn with_capacity(large: bool, rows: usize) -> Self {
+        Self(ByteColumn::with_capacity(large, rows))
     }
 
     fn len(&self) -> usize {
@@ -2472,11 +2483,21 @@ pub struct MessageDecoder {
 
 impl MessageDecoder {
     pub fn new(descriptor: &MessageDescriptor, config: &PtarsConfig) -> Self {
+        Self::with_capacity(descriptor, config, 0)
+    }
+
+    /// Like [`MessageDecoder::new`], with the builders of singular scalar
+    /// fields sized for `capacity` rows.
+    pub fn with_capacity(
+        descriptor: &MessageDescriptor,
+        config: &PtarsConfig,
+        capacity: usize,
+    ) -> Self {
         let mut decoders = Vec::new();
         let mut max_field_number: u32 = 0;
 
         for field in descriptor.fields() {
-            if let Some(decoder) = build_field_decoder(&field, config) {
+            if let Some(decoder) = build_field_decoder(&field, config, capacity) {
                 if field.number() > max_field_number {
                     max_field_number = field.number();
                 }
@@ -2647,7 +2668,12 @@ impl MessageDecoder {
 // build_field_decoder
 // ---------------------------------------------------------------------------
 
-fn build_field_decoder(field: &FieldDescriptor, config: &PtarsConfig) -> Option<FieldDecoder> {
+/// `capacity`: rows to size scalar builders for (0 when unknown).
+fn build_field_decoder(
+    field: &FieldDescriptor,
+    config: &PtarsConfig,
+    capacity: usize,
+) -> Option<FieldDecoder> {
     if field.is_map() {
         return build_map_decoder(field, config);
     }
@@ -2661,94 +2687,94 @@ fn build_field_decoder(field: &FieldDescriptor, config: &PtarsConfig) -> Option<
             value: 0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Int64 => Some(FieldDecoder::Int64 {
             value: 0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Uint32 => Some(FieldDecoder::UInt32 {
             value: 0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Uint64 => Some(FieldDecoder::UInt64 {
             value: 0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Sint32 => Some(FieldDecoder::Sint32 {
             value: 0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Sint64 => Some(FieldDecoder::Sint64 {
             value: 0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Sfixed32 => Some(FieldDecoder::Sfixed32 {
             value: 0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Sfixed64 => Some(FieldDecoder::Sfixed64 {
             value: 0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Fixed32 => Some(FieldDecoder::Fixed32 {
             value: 0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Fixed64 => Some(FieldDecoder::Fixed64 {
             value: 0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Float => Some(FieldDecoder::Float {
             value: 0.0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Double => Some(FieldDecoder::Double {
             value: 0.0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Bool => Some(FieldDecoder::Bool {
             value: false,
             has_value: false,
             has_presence,
-            builder: BooleanBuilder::new(),
+            builder: BooleanBuilder::with_capacity(capacity),
         }),
         Kind::String => Some(FieldDecoder::String {
             has_presence,
-            builder: StringColumn::new(config.use_large_string),
+            builder: StringColumn::with_capacity(config.use_large_string, capacity),
         }),
         Kind::Bytes => Some(FieldDecoder::Bytes {
             has_presence,
-            builder: ByteColumn::new(config.use_large_binary),
+            builder: ByteColumn::with_capacity(config.use_large_binary, capacity),
         }),
         Kind::Enum(enum_desc) => match config.enum_repr {
             EnumRepr::Int32 => Some(FieldDecoder::EnumInt32 {
                 value: 0,
                 has_value: false,
                 has_presence,
-                builder: PrimitiveBuilder::new(),
+                builder: PrimitiveBuilder::with_capacity(capacity),
             }),
             EnumRepr::String => Some(FieldDecoder::EnumString {
                 value: 0,
@@ -3156,7 +3182,7 @@ pub fn binary_array_to_record_batch_direct(
     descriptor: &MessageDescriptor,
     config: &PtarsConfig,
 ) -> Result<RecordBatch, prost::DecodeError> {
-    let mut decoder = MessageDecoder::new(descriptor, config);
+    let mut decoder = MessageDecoder::with_capacity(descriptor, config, array.len());
     let policy = config.confluent_wire_policy;
     for i in 0..array.len() {
         if array.is_null(i) {
