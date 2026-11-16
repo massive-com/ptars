@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use arrow::array::ArrayData;
@@ -23,11 +24,21 @@ use crate::config::{ConfluentWirePolicy, EnumRepr, PtarsConfig};
 // ---------------------------------------------------------------------------
 
 #[allow(deprecated)]
-fn decode_error(msg: &str) -> prost::DecodeError {
-    prost::DecodeError::new(msg.to_string())
+fn decode_error(msg: impl Into<Cow<'static, str>>) -> prost::DecodeError {
+    prost::DecodeError::new(msg)
 }
 
+#[inline(always)]
 fn decode_varint(buf: &[u8]) -> Result<(u64, usize), prost::DecodeError> {
+    match buf.first() {
+        // one byte is very common; most field tags, and small values
+        Some(&byte) if byte < 0x80 => Ok((byte as u64, 1)),
+        _ => decode_varint_slow(buf),
+    }
+}
+
+#[cold]
+fn decode_varint_slow(buf: &[u8]) -> Result<(u64, usize), prost::DecodeError> {
     let mut result: u64 = 0;
     let mut shift = 0u32;
     for (i, &byte) in buf.iter().enumerate() {
