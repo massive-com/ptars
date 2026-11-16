@@ -1351,6 +1351,20 @@ fn push_or_replace<T: ArrowPrimitiveType>(
     }
 }
 
+#[inline(always)]
+fn push_or_replace_with<T: ArrowPrimitiveType, const N: usize>(
+    builder: &mut PrimitiveBuilder<T>,
+    buf: &[u8],
+    has_value: &mut bool,
+    f: impl FnOnce([u8; N]) -> T::Native,
+) -> Result<usize, prost::DecodeError> {
+    if buf.len() < N {
+        return Err(decode_error("unexpected EOF"));
+    }
+    push_or_replace(builder, (f)(buf[..N].try_into().unwrap()), has_value);
+    Ok(N)
+}
+
 macro_rules! flush_primitive {
     ($value:expr, $has_value:expr, $has_presence:expr, $builder:expr, $default:expr) => {
         if *$has_value {
@@ -1519,85 +1533,37 @@ impl FieldDecoder {
                 if wire_type != 5 {
                     return skip_field(wire_type, buf);
                 }
-                if buf.len() < 4 {
-                    return Err(decode_error("unexpected EOF"));
-                }
-                push_or_replace(
-                    builder,
-                    i32::from_le_bytes(buf[..4].try_into().unwrap()),
-                    has_value,
-                );
-                Ok(4)
+                push_or_replace_with(builder, buf, has_value, i32::from_le_bytes)
             }
             Self::Sfixed64 { builder, .. } => {
                 if wire_type != 1 {
                     return skip_field(wire_type, buf);
                 }
-                if buf.len() < 8 {
-                    return Err(decode_error("unexpected EOF"));
-                }
-                push_or_replace(
-                    builder,
-                    i64::from_le_bytes(buf[..8].try_into().unwrap()),
-                    has_value,
-                );
-                Ok(8)
+                push_or_replace_with(builder, buf, has_value, i64::from_le_bytes)
             }
             Self::Fixed32 { builder, .. } => {
                 if wire_type != 5 {
                     return skip_field(wire_type, buf);
                 }
-                if buf.len() < 4 {
-                    return Err(decode_error("unexpected EOF"));
-                }
-                push_or_replace(
-                    builder,
-                    u32::from_le_bytes(buf[..4].try_into().unwrap()),
-                    has_value,
-                );
-                Ok(4)
+                push_or_replace_with(builder, buf, has_value, u32::from_le_bytes)
             }
             Self::Fixed64 { builder, .. } => {
                 if wire_type != 1 {
                     return skip_field(wire_type, buf);
                 }
-                if buf.len() < 8 {
-                    return Err(decode_error("unexpected EOF"));
-                }
-                push_or_replace(
-                    builder,
-                    u64::from_le_bytes(buf[..8].try_into().unwrap()),
-                    has_value,
-                );
-                Ok(8)
+                push_or_replace_with(builder, buf, has_value, u64::from_le_bytes)
             }
             Self::Float { builder, .. } => {
                 if wire_type != 5 {
                     return skip_field(wire_type, buf);
                 }
-                if buf.len() < 4 {
-                    return Err(decode_error("unexpected EOF"));
-                }
-                push_or_replace(
-                    builder,
-                    f32::from_le_bytes(buf[..4].try_into().unwrap()),
-                    has_value,
-                );
-                Ok(4)
+                push_or_replace_with(builder, buf, has_value, f32::from_le_bytes)
             }
             Self::Double { builder, .. } => {
                 if wire_type != 1 {
                     return skip_field(wire_type, buf);
                 }
-                if buf.len() < 8 {
-                    return Err(decode_error("unexpected EOF"));
-                }
-                push_or_replace(
-                    builder,
-                    f64::from_le_bytes(buf[..8].try_into().unwrap()),
-                    has_value,
-                );
-                Ok(8)
+                push_or_replace_with(builder, buf, has_value, f64::from_le_bytes)
             }
             Self::Bool {
                 value, has_value, ..
