@@ -892,76 +892,54 @@ impl RepeatedInner {
 // ---------------------------------------------------------------------------
 
 enum FieldDecoder {
-    // --- Singular scalars (buffered) ---
+    // --- Singular scalars ---
+    // Appended directly in `decode`, except `Bool`, `EnumString` and
+    // `EnumBinary`, which buffer `value` until `flush`.
     Int32 {
-        value: i32,
-        has_value: bool,
         has_presence: bool,
         builder: PrimitiveBuilder<Int32Type>,
     },
     Int64 {
-        value: i64,
-        has_value: bool,
         has_presence: bool,
         builder: PrimitiveBuilder<Int64Type>,
     },
     UInt32 {
-        value: u32,
-        has_value: bool,
         has_presence: bool,
         builder: PrimitiveBuilder<UInt32Type>,
     },
     UInt64 {
-        value: u64,
-        has_value: bool,
         has_presence: bool,
         builder: PrimitiveBuilder<UInt64Type>,
     },
     Sint32 {
-        value: i32,
-        has_value: bool,
         has_presence: bool,
         builder: PrimitiveBuilder<Int32Type>,
     },
     Sint64 {
-        value: i64,
-        has_value: bool,
         has_presence: bool,
         builder: PrimitiveBuilder<Int64Type>,
     },
     Sfixed32 {
-        value: i32,
-        has_value: bool,
         has_presence: bool,
         builder: PrimitiveBuilder<Int32Type>,
     },
     Sfixed64 {
-        value: i64,
-        has_value: bool,
         has_presence: bool,
         builder: PrimitiveBuilder<Int64Type>,
     },
     Fixed32 {
-        value: u32,
-        has_value: bool,
         has_presence: bool,
         builder: PrimitiveBuilder<UInt32Type>,
     },
     Fixed64 {
-        value: u64,
-        has_value: bool,
         has_presence: bool,
         builder: PrimitiveBuilder<UInt64Type>,
     },
     Float {
-        value: f32,
-        has_value: bool,
         has_presence: bool,
         builder: PrimitiveBuilder<Float32Type>,
     },
     Double {
-        value: f64,
-        has_value: bool,
         has_presence: bool,
         builder: PrimitiveBuilder<Float64Type>,
     },
@@ -980,8 +958,6 @@ enum FieldDecoder {
         builder: ByteColumn,
     },
     EnumInt32 {
-        value: i32,
-        has_value: bool,
         has_presence: bool,
         builder: PrimitiveBuilder<Int32Type>,
     },
@@ -1266,18 +1242,14 @@ fn push_or_replace_with<T: ArrowPrimitiveType, const N: usize>(
     Ok(N)
 }
 
-macro_rules! flush_primitive {
-    ($value:expr, $has_value:expr, $has_presence:expr, $builder:expr, $default:expr) => {
-        if *$has_value {
-            $builder.append_value(*$value);
-        } else if *$has_presence {
-            $builder.append_null();
-        } else {
-            $builder.append_value($default);
-        }
-        *$has_value = false;
-        *$value = $default;
-    };
+/// Ends a row for a directly appended primitive field that was absent from
+/// the message: null where the field has presence, the default otherwise.
+fn append_absent<T: ArrowPrimitiveType>(builder: &mut PrimitiveBuilder<T>, has_presence: bool) {
+    if has_presence {
+        builder.append_null();
+    } else {
+        builder.append_value(T::Native::default());
+    }
 }
 
 fn finish_primitive<T: ArrowPrimitiveType>(builder: &mut PrimitiveBuilder<T>) -> Arc<dyn Array> {
@@ -1770,96 +1742,59 @@ impl FieldDecoder {
 
     fn flush(&mut self) {
         match self {
+            // Appended in decode; flushed only when absent from the row.
             Self::Int32 {
-                value,
-                has_value,
                 has_presence,
                 builder,
             }
             | Self::Sint32 {
-                value,
-                has_value,
                 has_presence,
                 builder,
             }
             | Self::Sfixed32 {
-                value,
-                has_value,
                 has_presence,
                 builder,
             }
             | Self::EnumInt32 {
-                value,
-                has_value,
                 has_presence,
                 builder,
-            } => {
-                flush_primitive!(value, has_value, has_presence, builder, 0i32);
-            }
+            } => append_absent(builder, *has_presence),
             Self::Int64 {
-                value,
-                has_value,
                 has_presence,
                 builder,
             }
             | Self::Sint64 {
-                value,
-                has_value,
                 has_presence,
                 builder,
             }
             | Self::Sfixed64 {
-                value,
-                has_value,
                 has_presence,
                 builder,
-            } => {
-                flush_primitive!(value, has_value, has_presence, builder, 0i64);
-            }
+            } => append_absent(builder, *has_presence),
             Self::UInt32 {
-                value,
-                has_value,
                 has_presence,
                 builder,
             }
             | Self::Fixed32 {
-                value,
-                has_value,
                 has_presence,
                 builder,
-            } => {
-                flush_primitive!(value, has_value, has_presence, builder, 0u32);
-            }
+            } => append_absent(builder, *has_presence),
             Self::UInt64 {
-                value,
-                has_value,
                 has_presence,
                 builder,
             }
             | Self::Fixed64 {
-                value,
-                has_value,
                 has_presence,
                 builder,
-            } => {
-                flush_primitive!(value, has_value, has_presence, builder, 0u64);
-            }
+            } => append_absent(builder, *has_presence),
             Self::Float {
-                value,
-                has_value,
                 has_presence,
                 builder,
-            } => {
-                flush_primitive!(value, has_value, has_presence, builder, 0.0f32);
-            }
+            } => append_absent(builder, *has_presence),
             Self::Double {
-                value,
-                has_value,
                 has_presence,
                 builder,
-            } => {
-                flush_primitive!(value, has_value, has_presence, builder, 0.0f64);
-            }
+            } => append_absent(builder, *has_presence),
             Self::EnumString {
                 value,
                 has_value,
@@ -2138,13 +2073,9 @@ impl FieldDecoder {
                 has_value,
                 is_valid,
             } => {
-                if *has_value {
-                    is_valid.append_value(true);
-                    sub_decoder.flush_row();
-                } else {
-                    is_valid.append_value(false);
-                    sub_decoder.flush_defaults();
-                }
+                // Absent: every field of the struct gets its default.
+                is_valid.append_value(*has_value);
+                sub_decoder.flush_unseen();
                 *has_value = false;
             }
             // Repeated fields: push offset
@@ -2519,14 +2450,6 @@ impl MessageDecoder {
         }
     }
 
-    fn flush_row(&mut self) {
-        self.flush_unseen();
-    }
-
-    fn flush_defaults(&mut self) {
-        self.flush_unseen(); // all absent → defaults
-    }
-
     fn decode_null_row(&mut self) {
         self.flush_unseen();
         self.num_rows += 1;
@@ -2611,74 +2534,50 @@ fn build_field_decoder(
     let has_presence = field.supports_presence();
     match field.kind() {
         Kind::Int32 => Some(FieldDecoder::Int32 {
-            value: 0,
-            has_value: false,
             has_presence,
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Int64 => Some(FieldDecoder::Int64 {
-            value: 0,
-            has_value: false,
             has_presence,
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Uint32 => Some(FieldDecoder::UInt32 {
-            value: 0,
-            has_value: false,
             has_presence,
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Uint64 => Some(FieldDecoder::UInt64 {
-            value: 0,
-            has_value: false,
             has_presence,
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Sint32 => Some(FieldDecoder::Sint32 {
-            value: 0,
-            has_value: false,
             has_presence,
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Sint64 => Some(FieldDecoder::Sint64 {
-            value: 0,
-            has_value: false,
             has_presence,
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Sfixed32 => Some(FieldDecoder::Sfixed32 {
-            value: 0,
-            has_value: false,
             has_presence,
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Sfixed64 => Some(FieldDecoder::Sfixed64 {
-            value: 0,
-            has_value: false,
             has_presence,
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Fixed32 => Some(FieldDecoder::Fixed32 {
-            value: 0,
-            has_value: false,
             has_presence,
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Fixed64 => Some(FieldDecoder::Fixed64 {
-            value: 0,
-            has_value: false,
             has_presence,
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Float => Some(FieldDecoder::Float {
-            value: 0.0,
-            has_value: false,
             has_presence,
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Double => Some(FieldDecoder::Double {
-            value: 0.0,
-            has_value: false,
             has_presence,
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
@@ -2698,8 +2597,6 @@ fn build_field_decoder(
         }),
         Kind::Enum(enum_desc) => match config.enum_repr {
             EnumRepr::Int32 => Some(FieldDecoder::EnumInt32 {
-                value: 0,
-                has_value: false,
                 has_presence,
                 builder: PrimitiveBuilder::with_capacity(capacity),
             }),
@@ -3019,74 +2916,50 @@ fn build_singular_decoder_for_map(
     // Map keys/values are never "optional" in protobuf sense — they use proto3 defaults
     match field.kind() {
         Kind::Int32 => Some(FieldDecoder::Int32 {
-            value: 0,
-            has_value: false,
             has_presence: false,
             builder: PrimitiveBuilder::new(),
         }),
         Kind::Int64 => Some(FieldDecoder::Int64 {
-            value: 0,
-            has_value: false,
             has_presence: false,
             builder: PrimitiveBuilder::new(),
         }),
         Kind::Uint32 => Some(FieldDecoder::UInt32 {
-            value: 0,
-            has_value: false,
             has_presence: false,
             builder: PrimitiveBuilder::new(),
         }),
         Kind::Uint64 => Some(FieldDecoder::UInt64 {
-            value: 0,
-            has_value: false,
             has_presence: false,
             builder: PrimitiveBuilder::new(),
         }),
         Kind::Sint32 => Some(FieldDecoder::Sint32 {
-            value: 0,
-            has_value: false,
             has_presence: false,
             builder: PrimitiveBuilder::new(),
         }),
         Kind::Sint64 => Some(FieldDecoder::Sint64 {
-            value: 0,
-            has_value: false,
             has_presence: false,
             builder: PrimitiveBuilder::new(),
         }),
         Kind::Sfixed32 => Some(FieldDecoder::Sfixed32 {
-            value: 0,
-            has_value: false,
             has_presence: false,
             builder: PrimitiveBuilder::new(),
         }),
         Kind::Sfixed64 => Some(FieldDecoder::Sfixed64 {
-            value: 0,
-            has_value: false,
             has_presence: false,
             builder: PrimitiveBuilder::new(),
         }),
         Kind::Fixed32 => Some(FieldDecoder::Fixed32 {
-            value: 0,
-            has_value: false,
             has_presence: false,
             builder: PrimitiveBuilder::new(),
         }),
         Kind::Fixed64 => Some(FieldDecoder::Fixed64 {
-            value: 0,
-            has_value: false,
             has_presence: false,
             builder: PrimitiveBuilder::new(),
         }),
         Kind::Float => Some(FieldDecoder::Float {
-            value: 0.0,
-            has_value: false,
             has_presence: false,
             builder: PrimitiveBuilder::new(),
         }),
         Kind::Double => Some(FieldDecoder::Double {
-            value: 0.0,
-            has_value: false,
             has_presence: false,
             builder: PrimitiveBuilder::new(),
         }),
@@ -3106,8 +2979,6 @@ fn build_singular_decoder_for_map(
         }),
         Kind::Enum(enum_desc) => match config.enum_repr {
             EnumRepr::Int32 => Some(FieldDecoder::EnumInt32 {
-                value: 0,
-                has_value: false,
                 has_presence: false,
                 builder: PrimitiveBuilder::new(),
             }),
