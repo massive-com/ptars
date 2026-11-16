@@ -340,6 +340,7 @@ impl ByteColumn {
         self.offsets.len() - 1
     }
 
+    #[inline(always)]
     fn push(&mut self, value: &[u8]) {
         self.values.extend_from_slice(value);
         self.offsets.push(self.values.len() as i64);
@@ -351,18 +352,22 @@ impl ByteColumn {
         self.nulls.append_null();
     }
 
-    /// Appends `value`, or replaces the value appended earlier in this row
-    /// when the field occurs again (`has_value`).
+    #[inline]
     fn push_or_replace(&mut self, value: &[u8], has_value: &mut bool) {
         if *has_value {
-            let start = self.offsets[self.offsets.len() - 2] as usize;
-            self.values.truncate(start);
-            self.values.extend_from_slice(value);
-            *self.offsets.last_mut().unwrap() = self.values.len() as i64;
+            self.replace_cold(value);
         } else {
             self.push(value);
             *has_value = true;
         }
+    }
+
+    #[cold]
+    fn replace_cold(&mut self, value: &[u8]) {
+        let start = self.offsets[self.offsets.len() - 2] as usize;
+        self.values.truncate(start);
+        self.values.extend_from_slice(value);
+        *self.offsets.last_mut().unwrap() = self.values.len() as i64;
     }
 
     /// Builds a binary array, large or not as configured.
