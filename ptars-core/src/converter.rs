@@ -5619,6 +5619,11 @@ mod tests {
                 parts
             })
             .collect();
-        assert_concatenation_merges(&descriptor, &rows, &[PtarsConfig::default()]);
+        let large = PtarsConfig {
+            use_large_string: true,
+            use_large_binary: true,
+            ..PtarsConfig::default()
+        };
+        assert_concatenation_merges(&descriptor, &rows, &[PtarsConfig::default(), large]);
     }
 }
