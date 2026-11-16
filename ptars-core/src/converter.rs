@@ -5626,4 +5626,38 @@ mod tests {
         };
         assert_concatenation_merges(&descriptor, &rows, &[PtarsConfig::default(), large]);
     }
+
+    /// Many fields (130), mixing directly appended (int64, string, double)
+    /// and buffered (bool) ones.
+    #[test]
+    fn test_concatenated_messages_merge_wide() {
+        let types = [Type::Int64, Type::String, Type::Bool, Type::Double];
+        let fields = (1..=130)
+            .map(|n| scalar_field(&format!("f{n}"), n, types[n as usize % types.len()]))
+            .collect();
+        let file_descriptor = FileDescriptorProto {
+            name: Some("wide.proto".to_string()),
+            package: Some("test".to_string()),
+            syntax: Some("proto3".to_string()),
+            message_type: vec![DescriptorProto {
+                name: Some("Wide".to_string()),
+                field: fields,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let descriptor = create_pool_with_message(file_descriptor)
+            .get_message_by_name("test.Wide")
+            .unwrap();
+        let rows: Vec<_> = (0..8)
+            .map(|seed| {
+                let mut parts = vec![merge_sample(&descriptor, seed)];
+                if seed % 2 == 0 {
+                    parts.push(merge_sample(&descriptor, seed + 100));
+                }
+                parts
+            })
+            .collect();
+        assert_concatenation_merges(&descriptor, &rows, &[PtarsConfig::default()]);
+    }
 }
