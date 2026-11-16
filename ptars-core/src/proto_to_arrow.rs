@@ -2,16 +2,19 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use arrow::array::ArrayData;
-use arrow::buffer::Buffer;
+use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
 use arrow_array::builder::ArrayBuilder;
 use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, LargeBinaryBuilder, LargeStringBuilder, PrimitiveBuilder,
-    StringBuilder,
+    BinaryBuilder, BooleanBuilder, LargeBinaryBuilder, LargeStringBuilder, NullBufferBuilder,
+    PrimitiveBuilder, StringBuilder,
 };
 use arrow_array::types::{
     Date32Type, Float32Type, Float64Type, Int32Type, Int64Type, UInt32Type, UInt64Type,
 };
-use arrow_array::{Array, ArrowPrimitiveType, BinaryArray, MapArray, RecordBatch, StructArray};
+use arrow_array::{
+    Array, ArrowPrimitiveType, BinaryArray, LargeBinaryArray, LargeStringArray, MapArray,
+    RecordBatch, StringArray, StructArray,
+};
 use arrow_schema::{DataType, Field, TimeUnit};
 use chrono::Datelike;
 
@@ -217,9 +220,6 @@ impl StringBuilderInner {
             Self::Large(b) => b.append_null(),
         }
     }
-    fn append_default(&mut self) {
-        self.append_value("");
-    }
     fn finish(&mut self) -> Arc<dyn Array> {
         match self {
             Self::Regular(b) => Arc::new(std::mem::take(b).finish()),
@@ -259,9 +259,6 @@ impl BinaryBuilderInner {
             Self::Large(b) => b.append_null(),
         }
     }
-    fn append_default(&mut self) {
-        self.append_value(b"");
-    }
     fn finish(&mut self) -> Arc<dyn Array> {
         match self {
             Self::Regular(b) => Arc::new(std::mem::take(b).finish()),
@@ -272,6 +269,126 @@ impl BinaryBuilderInner {
         match self {
             Self::Regular(b) => ArrayBuilder::len(b),
             Self::Large(b) => ArrayBuilder::len(b),
+        }
+    }
+}
+
+/// A binary column of a singular field, built one row at a time. Unlike
+/// arrow's builders, the value appended last can be replaced, for a field
+/// that occurs more than once in a message (last one wins). Strings use
+/// [`StringColumn`].
+struct ByteColumn {
+    /// Starts with 0; one end offset per row. `i64` until [`Self::finish`].
+    offsets: Vec<i64>,
+    values: Vec<u8>,
+    nulls: NullBufferBuilder,
+    large: bool,
+}
+
+impl ByteColumn {
+    fn new(large: bool) -> Self {
+        Self {
+            offsets: vec![0],
+            values: Vec::new(),
+            nulls: NullBufferBuilder::new(0),
+            large,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.offsets.len() - 1
+    }
+
+    fn push(&mut self, value: &[u8]) {
+        self.values.extend_from_slice(value);
+        self.offsets.push(self.values.len() as i64);
+        self.nulls.append_non_null();
+    }
+
+    fn push_null(&mut self) {
+        self.offsets.push(self.values.len() as i64);
+        self.nulls.append_null();
+    }
+
+    /// Appends `value`, or replaces the value appended earlier in this row
+    /// when the field occurs again (`has_value`).
+    fn push_or_replace(&mut self, value: &[u8], has_value: &mut bool) {
+        if *has_value {
+            let start = self.offsets[self.offsets.len() - 2] as usize;
+            self.values.truncate(start);
+            self.values.extend_from_slice(value);
+            *self.offsets.last_mut().unwrap() = self.values.len() as i64;
+        } else {
+            self.push(value);
+            *has_value = true;
+        }
+    }
+
+    /// Builds a binary array, large or not as configured.
+    fn finish(&mut self) -> Arc<dyn Array> {
+        let (offsets, values, nulls) = self.take_parts();
+        if self.large {
+            let offsets = OffsetBuffer::new(offsets.into());
+            Arc::new(LargeBinaryArray::new(offsets, values, nulls))
+        } else {
+            Arc::new(BinaryArray::new(narrow_offsets(offsets), values, nulls))
+        }
+    }
+
+    /// The offsets, values and nulls so far; the column is left empty.
+    fn take_parts(&mut self) -> (Vec<i64>, Buffer, Option<NullBuffer>) {
+        let offsets = std::mem::replace(&mut self.offsets, vec![0]);
+        let values = Buffer::from_vec(std::mem::take(&mut self.values));
+        (offsets, values, self.nulls.finish())
+    }
+}
+
+/// `i32` offsets for an array that isn't large.
+fn narrow_offsets(offsets: Vec<i64>) -> OffsetBuffer<i32> {
+    let offsets: Vec<i32> = offsets
+        .into_iter()
+        .map(|o| i32::try_from(o).expect("byte array offset overflow"))
+        .collect();
+    OffsetBuffer::new(offsets.into())
+}
+
+/// A [`ByteColumn`] of strings. It only takes `&str`, so every value is
+/// UTF-8 and [`Self::finish`] can build a string array without checking.
+struct StringColumn(ByteColumn);
+
+impl StringColumn {
+    fn new(large: bool) -> Self {
+        Self(ByteColumn::new(large))
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    fn push(&mut self, value: &str) {
+        self.0.push(value.as_bytes());
+    }
+
+    fn push_null(&mut self) {
+        self.0.push_null();
+    }
+
+    #[inline]
+    fn push_or_replace(&mut self, value: &str, has_value: &mut bool) {
+        self.0.push_or_replace(value.as_bytes(), has_value);
+    }
+
+    /// Builds a string array, large or not as configured.
+    fn finish(&mut self) -> Arc<dyn Array> {
+        let (offsets, values, nulls) = self.0.take_parts();
+        // SAFETY: only `&str` values were pushed, so every value is UTF-8.
+        if self.0.large {
+            let offsets = OffsetBuffer::new(offsets.into());
+            Arc::new(unsafe { LargeStringArray::new_unchecked(offsets, values, nulls) })
+        } else {
+            let offsets = narrow_offsets(offsets);
+            Arc::new(unsafe { StringArray::new_unchecked(offsets, values, nulls) })
         }
     }
 }
@@ -904,16 +1021,12 @@ enum FieldDecoder {
         builder: BooleanBuilder,
     },
     String {
-        value: Vec<u8>,
-        has_value: bool,
         has_presence: bool,
-        builder: StringBuilderInner,
+        builder: StringColumn,
     },
     Bytes {
-        value: Vec<u8>,
-        has_value: bool,
         has_presence: bool,
-        builder: BinaryBuilderInner,
+        builder: ByteColumn,
     },
     EnumInt32 {
         value: i32,
@@ -1444,29 +1557,20 @@ impl FieldDecoder {
                 *has_value = true;
                 Ok(n)
             }
-            Self::String {
-                value, has_value, ..
-            } => {
+            Self::String { builder, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                validate_utf8(data)?;
-                value.clear();
-                value.extend_from_slice(data);
-                *has_value = true;
+                builder.push_or_replace(validate_utf8(data)?, has_value);
                 Ok(total)
             }
-            Self::Bytes {
-                value, has_value, ..
-            } => {
+            Self::Bytes { builder, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                value.clear();
-                value.extend_from_slice(data);
-                *has_value = true;
+                builder.push_or_replace(data, has_value);
                 Ok(total)
             }
             // Well-known types: decode submessage
@@ -1853,37 +1957,26 @@ impl FieldDecoder {
                 *has_value = false;
                 *value = false;
             }
+            // Appended in decode; flushed only when absent from the row.
             Self::String {
-                value,
-                has_value,
                 has_presence,
                 builder,
             } => {
-                if *has_value {
-                    builder.append_value(unsafe { std::str::from_utf8_unchecked(value) });
-                } else if *has_presence {
-                    builder.append_null();
+                if *has_presence {
+                    builder.push_null();
                 } else {
-                    builder.append_default();
+                    builder.push("");
                 }
-                *has_value = false;
-                value.clear();
             }
             Self::Bytes {
-                value,
-                has_value,
                 has_presence,
                 builder,
             } => {
-                if *has_value {
-                    builder.append_value(value.as_slice());
-                } else if *has_presence {
-                    builder.append_null();
+                if *has_presence {
+                    builder.push_null();
                 } else {
-                    builder.append_default();
+                    builder.push(b"");
                 }
-                *has_value = false;
-                value.clear();
             }
             // Well-known types
             Self::Timestamp {
@@ -2161,8 +2254,10 @@ impl FieldDecoder {
             Self::Float { builder, .. } => finish_primitive(builder),
             Self::Double { builder, .. } => finish_primitive(builder),
             Self::Bool { builder, .. } => Arc::new(std::mem::take(builder).finish()),
-            Self::String { builder, .. } | Self::EnumString { builder, .. } => builder.finish(),
-            Self::Bytes { builder, .. } | Self::EnumBinary { builder, .. } => builder.finish(),
+            Self::String { builder, .. } => builder.finish(),
+            Self::EnumString { builder, .. } => builder.finish(),
+            Self::Bytes { builder, .. } => builder.finish(),
+            Self::EnumBinary { builder, .. } => builder.finish(),
             Self::Timestamp {
                 builder, unit, tz, ..
             } => finish_timestamp(builder, *unit, tz),
@@ -2628,16 +2723,12 @@ fn build_field_decoder(field: &FieldDescriptor, config: &PtarsConfig) -> Option<
             builder: BooleanBuilder::new(),
         }),
         Kind::String => Some(FieldDecoder::String {
-            value: Vec::new(),
-            has_value: false,
             has_presence,
-            builder: StringBuilderInner::new(config.use_large_string),
+            builder: StringColumn::new(config.use_large_string),
         }),
         Kind::Bytes => Some(FieldDecoder::Bytes {
-            value: Vec::new(),
-            has_value: false,
             has_presence,
-            builder: BinaryBuilderInner::new(config.use_large_binary),
+            builder: ByteColumn::new(config.use_large_binary),
         }),
         Kind::Enum(enum_desc) => match config.enum_repr {
             EnumRepr::Int32 => Some(FieldDecoder::EnumInt32 {
@@ -3006,16 +3097,12 @@ fn build_singular_decoder_for_map(
             builder: BooleanBuilder::new(),
         }),
         Kind::String => Some(FieldDecoder::String {
-            value: Vec::new(),
-            has_value: false,
             has_presence: false,
-            builder: StringBuilderInner::new(config.use_large_string),
+            builder: StringColumn::new(config.use_large_string),
         }),
         Kind::Bytes => Some(FieldDecoder::Bytes {
-            value: Vec::new(),
-            has_value: false,
             has_presence: false,
-            builder: BinaryBuilderInner::new(config.use_large_binary),
+            builder: ByteColumn::new(config.use_large_binary),
         }),
         Kind::Enum(enum_desc) => match config.enum_repr {
             EnumRepr::Int32 => Some(FieldDecoder::EnumInt32 {
