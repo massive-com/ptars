@@ -1392,7 +1392,10 @@ fn finish_time_of_day(builder: &mut PrimitiveBuilder<Int64Type>, unit: TimeUnit)
 impl FieldDecoder {
     /// Decodes one occurrence of this field. Singular numbers, enum numbers,
     /// strings and bytes are appended directly and set `has_value`; a repeat in
-    /// the same row replaces the value. Other fields leave `has_value` alone.
+    /// the same row replaces the value. Bools (arrow's `BooleanBuilder` can't
+    /// replace a value), enum names, wrapper and well-known types buffer their
+    /// value until [`Self::flush`] and leave `has_value` alone.
+    #[inline(always)]
     fn decode(
         &mut self,
         wire_type: u8,
@@ -1785,34 +1788,44 @@ impl FieldDecoder {
                 key_decoder,
                 value_decoder,
                 ..
-            } => {
-                if wire_type != 2 {
-                    return skip_field(wire_type, buf);
-                }
-                let (data, total) = read_length_delimited(buf)?;
-                // Parse entry submessage: field 1 = key, field 2 = value
-                let mut pos = 0;
-                let (mut key_seen, mut value_seen) = (false, false);
-                while pos < data.len() {
-                    let (fnum, wt, n) = decode_tag(&data[pos..])?;
-                    pos += n;
-                    if fnum == 1 {
-                        pos += key_decoder.decode(wt, &data[pos..], &mut key_seen)?;
-                    } else if fnum == 2 {
-                        pos += value_decoder.decode(wt, &data[pos..], &mut value_seen)?;
-                    } else {
-                        pos += skip_field(wt, &data[pos..])?;
-                    }
-                }
-                if !key_seen {
-                    key_decoder.flush();
-                }
-                if !value_seen {
-                    value_decoder.flush();
-                }
-                Ok(total)
+            } => Self::decode_map_entry(wire_type, buf, key_decoder, value_decoder),
+        }
+    }
+
+    /// Decodes one entry of a map field. Out of line, since it decodes the
+    /// key and the value with [`Self::decode`].
+    #[inline(never)]
+    fn decode_map_entry(
+        wire_type: u8,
+        buf: &[u8],
+        key_decoder: &mut FieldDecoder,
+        value_decoder: &mut FieldDecoder,
+    ) -> Result<usize, prost::DecodeError> {
+        if wire_type != 2 {
+            return skip_field(wire_type, buf);
+        }
+        let (data, total) = read_length_delimited(buf)?;
+        // Parse entry submessage: field 1 = key, field 2 = value
+        let mut pos = 0;
+        let (mut key_seen, mut value_seen) = (false, false);
+        while pos < data.len() {
+            let (fnum, wt, n) = decode_tag(&data[pos..])?;
+            pos += n;
+            if fnum == 1 {
+                pos += key_decoder.decode(wt, &data[pos..], &mut key_seen)?;
+            } else if fnum == 2 {
+                pos += value_decoder.decode(wt, &data[pos..], &mut value_seen)?;
+            } else {
+                pos += skip_field(wt, &data[pos..])?;
             }
         }
+        if !key_seen {
+            key_decoder.flush();
+        }
+        if !value_seen {
+            value_decoder.flush();
+        }
+        Ok(total)
     }
 
     fn flush(&mut self) {
