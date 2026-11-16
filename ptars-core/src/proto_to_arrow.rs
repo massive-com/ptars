@@ -933,7 +933,6 @@ enum FieldDecoder {
     },
     Bool {
         value: bool,
-        has_value: bool,
         builder: BooleanBuilder,
     },
     String {
@@ -949,13 +948,11 @@ enum FieldDecoder {
     },
     EnumString {
         value: i32,
-        has_value: bool,
         builder: StringBuilderInner,
         enum_names: EnumNames,
     },
     EnumBinary {
         value: i32,
-        has_value: bool,
         builder: BinaryBuilderInner,
         enum_names: EnumNames,
     },
@@ -964,7 +961,6 @@ enum FieldDecoder {
     Timestamp {
         seconds: i64,
         nanos: i32,
-        has_value: bool,
         builder: PrimitiveBuilder<Int64Type>,
         unit: TimeUnit,
         tz: Option<Arc<str>>,
@@ -972,7 +968,6 @@ enum FieldDecoder {
     Duration {
         seconds: i64,
         nanos: i32,
-        has_value: bool,
         builder: PrimitiveBuilder<Int64Type>,
         unit: TimeUnit,
     },
@@ -980,7 +975,6 @@ enum FieldDecoder {
         year: i32,
         month: i32,
         day: i32,
-        has_value: bool,
         builder: PrimitiveBuilder<Date32Type>,
     },
     TimeOfDay {
@@ -988,7 +982,6 @@ enum FieldDecoder {
         minutes: i32,
         seconds_val: i32,
         nanos: i32,
-        has_value: bool,
         builder: PrimitiveBuilder<Int64Type>,
         unit: TimeUnit,
     },
@@ -996,54 +989,44 @@ enum FieldDecoder {
     // --- Wrapper types (singular) ---
     WrapperDouble {
         value: f64,
-        has_value: bool,
         builder: PrimitiveBuilder<Float64Type>,
     },
     WrapperFloat {
         value: f32,
-        has_value: bool,
         builder: PrimitiveBuilder<Float32Type>,
     },
     WrapperInt64 {
         value: i64,
-        has_value: bool,
         builder: PrimitiveBuilder<Int64Type>,
     },
     WrapperUInt64 {
         value: u64,
-        has_value: bool,
         builder: PrimitiveBuilder<UInt64Type>,
     },
     WrapperInt32 {
         value: i32,
-        has_value: bool,
         builder: PrimitiveBuilder<Int32Type>,
     },
     WrapperUInt32 {
         value: u32,
-        has_value: bool,
         builder: PrimitiveBuilder<UInt32Type>,
     },
     WrapperBool {
         value: bool,
-        has_value: bool,
         builder: BooleanBuilder,
     },
     WrapperString {
         value: Vec<u8>,
-        has_value: bool,
         builder: StringBuilderInner,
     },
     WrapperBytes {
         value: Vec<u8>,
-        has_value: bool,
         builder: BinaryBuilderInner,
     },
 
     // --- Nested message ---
     Message {
         sub_decoder: Box<MessageDecoder>,
-        has_value: bool,
         is_valid: BooleanBuilder,
     },
 
@@ -1059,6 +1042,10 @@ enum FieldDecoder {
     Map {
         key_decoder: Box<FieldDecoder>,
         value_decoder: Box<FieldDecoder>,
+        /// What each entry's key and value flags start from. Map keys and
+        /// values have no presence, even in proto2.
+        key_flags: FieldFlags,
+        value_flags: FieldFlags,
         offsets: Vec<i32>,
         map_value_name: Arc<str>,
         map_value_nullable: bool,
@@ -1308,12 +1295,11 @@ fn finish_time_of_day(builder: &mut PrimitiveBuilder<Int64Type>, unit: TimeUnit)
 // ---------------------------------------------------------------------------
 
 impl FieldDecoder {
-    /// Decodes one occurrence of this field. Singular numbers, enum numbers,
-    /// strings and bytes are appended directly and set
-    /// [`FieldFlags::HAS_VALUE`]; a repeat in the same row replaces the value.
-    /// Bools (arrow's `BooleanBuilder` can't replace a value), enum names,
-    /// wrapper and well-known types buffer their value until [`Self::flush`]
-    /// and leave it unset.
+    /// Decodes one occurrence of this field and sets [`FieldFlags::HAS_VALUE`].
+    /// Singular numbers, enum numbers, strings and bytes are appended
+    /// directly; a repeat in the same row replaces the value. Bools (arrow's
+    /// `BooleanBuilder` can't replace a value), enum names, wrapper and
+    /// well-known types buffer their value until [`Self::flush`].
     #[inline(always)]
     fn decode(
         &mut self,
@@ -1330,18 +1316,13 @@ impl FieldDecoder {
                 push_or_replace(builder, v as i32, flags);
                 Ok(n)
             }
-            Self::EnumString {
-                value, has_value, ..
-            }
-            | Self::EnumBinary {
-                value, has_value, ..
-            } => {
+            Self::EnumString { value, .. } | Self::EnumBinary { value, .. } => {
                 if wire_type != 0 {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
                 *value = v as i32;
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(n)
             }
             Self::Int64 { builder, .. } => {
@@ -1420,15 +1401,13 @@ impl FieldDecoder {
                 }
                 push_or_replace_with(builder, buf, flags, f64::from_le_bytes)
             }
-            Self::Bool {
-                value, has_value, ..
-            } => {
+            Self::Bool { value, .. } => {
                 if wire_type != 0 {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
                 *value = v != 0;
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(n)
             }
             Self::String { builder, .. } => {
@@ -1448,12 +1427,7 @@ impl FieldDecoder {
                 Ok(total)
             }
             // Well-known types: decode submessage
-            Self::Timestamp {
-                seconds,
-                nanos,
-                has_value,
-                ..
-            } => {
+            Self::Timestamp { seconds, nanos, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
@@ -1461,15 +1435,10 @@ impl FieldDecoder {
                 let vals = decode_wkt_submessage(data, 2)?;
                 *seconds = vals[0];
                 *nanos = vals[1] as i32;
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(total)
             }
-            Self::Duration {
-                seconds,
-                nanos,
-                has_value,
-                ..
-            } => {
+            Self::Duration { seconds, nanos, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
@@ -1477,15 +1446,11 @@ impl FieldDecoder {
                 let vals = decode_wkt_submessage(data, 2)?;
                 *seconds = vals[0];
                 *nanos = vals[1] as i32;
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(total)
             }
             Self::Date {
-                year,
-                month,
-                day,
-                has_value,
-                ..
+                year, month, day, ..
             } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
@@ -1495,7 +1460,7 @@ impl FieldDecoder {
                 *year = vals[0] as i32;
                 *month = vals[1] as i32;
                 *day = vals[2] as i32;
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(total)
             }
             Self::TimeOfDay {
@@ -1503,7 +1468,6 @@ impl FieldDecoder {
                 minutes,
                 seconds_val,
                 nanos,
-                has_value,
                 ..
             } => {
                 if wire_type != 2 {
@@ -1515,13 +1479,11 @@ impl FieldDecoder {
                 *minutes = vals[1] as i32;
                 *seconds_val = vals[2] as i32;
                 *nanos = vals[3] as i32;
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(total)
             }
             // Wrapper types
-            Self::WrapperDouble {
-                value, has_value, ..
-            } => {
+            Self::WrapperDouble { value, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
@@ -1530,12 +1492,10 @@ impl FieldDecoder {
                 if found {
                     *value = f64::from_le_bytes(bytes);
                 }
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(total)
             }
-            Self::WrapperFloat {
-                value, has_value, ..
-            } => {
+            Self::WrapperFloat { value, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
@@ -1544,12 +1504,10 @@ impl FieldDecoder {
                 if found {
                     *value = f32::from_le_bytes(bytes);
                 }
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(total)
             }
-            Self::WrapperInt64 {
-                value, has_value, ..
-            } => {
+            Self::WrapperInt64 { value, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
@@ -1558,12 +1516,10 @@ impl FieldDecoder {
                 if found {
                     *value = v as i64;
                 }
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(total)
             }
-            Self::WrapperUInt64 {
-                value, has_value, ..
-            } => {
+            Self::WrapperUInt64 { value, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
@@ -1572,12 +1528,10 @@ impl FieldDecoder {
                 if found {
                     *value = v;
                 }
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(total)
             }
-            Self::WrapperInt32 {
-                value, has_value, ..
-            } => {
+            Self::WrapperInt32 { value, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
@@ -1586,12 +1540,10 @@ impl FieldDecoder {
                 if found {
                     *value = v as i32;
                 }
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(total)
             }
-            Self::WrapperUInt32 {
-                value, has_value, ..
-            } => {
+            Self::WrapperUInt32 { value, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
@@ -1600,12 +1552,10 @@ impl FieldDecoder {
                 if found {
                     *value = v as u32;
                 }
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(total)
             }
-            Self::WrapperBool {
-                value, has_value, ..
-            } => {
+            Self::WrapperBool { value, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
@@ -1614,12 +1564,10 @@ impl FieldDecoder {
                 if found {
                     *value = v != 0;
                 }
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(total)
             }
-            Self::WrapperString {
-                value, has_value, ..
-            } => {
+            Self::WrapperString { value, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
@@ -1628,12 +1576,10 @@ impl FieldDecoder {
                     value.clear();
                     value.extend_from_slice(v.as_bytes());
                 }
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(total)
             }
-            Self::WrapperBytes {
-                value, has_value, ..
-            } => {
+            Self::WrapperBytes { value, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
@@ -1642,15 +1588,11 @@ impl FieldDecoder {
                     value.clear();
                     value.extend_from_slice(v);
                 }
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(total)
             }
             // Nested message
-            Self::Message {
-                sub_decoder,
-                has_value,
-                ..
-            } => {
+            Self::Message { sub_decoder, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
@@ -1658,9 +1600,7 @@ impl FieldDecoder {
                 // For singular messages, if seen multiple times, the spec says merge.
                 // For simplicity (and matching DynamicMessage behavior), we decode fresh each time.
                 // Reset sub_decoder if already decoded this row.
-                if !*has_value {
-                    *has_value = true;
-                }
+                flags.insert(FieldFlags::HAS_VALUE);
                 sub_decoder.decode_message_bytes(data)?;
                 Ok(total)
             }
@@ -1670,8 +1610,17 @@ impl FieldDecoder {
             Self::Map {
                 key_decoder,
                 value_decoder,
+                key_flags,
+                value_flags,
                 ..
-            } => Self::decode_map_entry(wire_type, buf, key_decoder, value_decoder),
+            } => Self::decode_map_entry(
+                wire_type,
+                buf,
+                key_decoder,
+                value_decoder,
+                *key_flags,
+                *value_flags,
+            ),
         }
     }
 
@@ -1683,6 +1632,8 @@ impl FieldDecoder {
         buf: &[u8],
         key_decoder: &mut FieldDecoder,
         value_decoder: &mut FieldDecoder,
+        key_start: FieldFlags,
+        value_start: FieldFlags,
     ) -> Result<usize, prost::DecodeError> {
         if wire_type != 2 {
             return skip_field(wire_type, buf);
@@ -1690,7 +1641,7 @@ impl FieldDecoder {
         let (data, total) = read_length_delimited(buf)?;
         // Parse entry submessage: field 1 = key, field 2 = value
         let mut pos = 0;
-        let (mut key_flags, mut value_flags) = (FieldFlags::empty(), FieldFlags::empty());
+        let (mut key_flags, mut value_flags) = (key_start, value_start);
         while pos < data.len() {
             let (fnum, wt, n) = decode_tag(&data[pos..])?;
             pos += n;
@@ -1702,12 +1653,10 @@ impl FieldDecoder {
                 pos += skip_field(wt, &data[pos..])?;
             }
         }
-        // Map keys and values have no presence, even in proto2, so
-        // their flags never get `HAS_PRESENCE`.
-        if !key_flags.contains(FieldFlags::HAS_VALUE) {
+        if key_flags.needs_flush() {
             key_decoder.flush(key_flags);
         }
-        if !value_flags.contains(FieldFlags::HAS_VALUE) {
+        if value_flags.needs_flush() {
             value_decoder.flush(value_flags);
         }
         Ok(total)
@@ -1736,9 +1685,11 @@ impl FieldDecoder {
         })
     }
 
-    /// Ends a row for this field: an absent value is null with
-    /// [`FieldFlags::HAS_PRESENCE`], the default otherwise.
+    /// Ends a row for this field. [`FieldFlags::HAS_VALUE`]: the field
+    /// occurred in the row; otherwise its value is null with
+    /// [`FieldFlags::HAS_PRESENCE`], the default without.
     fn flush(&mut self, flags: FieldFlags) {
+        let has_value = flags.contains(FieldFlags::HAS_VALUE);
         let has_presence = flags.contains(FieldFlags::HAS_PRESENCE);
         match self {
             // Appended in decode; flushed only when absent from the row.
@@ -1765,49 +1716,40 @@ impl FieldDecoder {
             Self::Double { builder } => append_absent(builder, has_presence),
             Self::EnumString {
                 value,
-                has_value,
                 builder,
                 enum_names,
             } => {
-                if *has_value {
+                if has_value {
                     builder.append_value(enum_names.name(*value).as_ref());
                 } else if has_presence {
                     builder.append_null();
                 } else {
                     builder.append_value(enum_names.default_name().as_ref());
                 }
-                *has_value = false;
                 *value = 0;
             }
             Self::EnumBinary {
                 value,
-                has_value,
                 builder,
                 enum_names,
             } => {
-                if *has_value {
+                if has_value {
                     builder.append_value(enum_names.name(*value).as_bytes());
                 } else if has_presence {
                     builder.append_null();
                 } else {
                     builder.append_value(enum_names.default_name().as_bytes());
                 }
-                *has_value = false;
                 *value = 0;
             }
-            Self::Bool {
-                value,
-                has_value,
-                builder,
-            } => {
-                if *has_value {
+            Self::Bool { value, builder } => {
+                if has_value {
                     builder.append_value(*value);
                 } else if has_presence {
                     builder.append_null();
                 } else {
                     builder.append_value(false);
                 }
-                *has_value = false;
                 *value = false;
             }
             // Appended in decode; flushed only when absent from the row.
@@ -1829,34 +1771,30 @@ impl FieldDecoder {
             Self::Timestamp {
                 seconds,
                 nanos,
-                has_value,
                 builder,
                 unit,
                 ..
             } => {
-                if *has_value {
+                if has_value {
                     builder.append_value(convert_seconds_nanos_to_unit(*seconds, *nanos, *unit));
                 } else {
                     builder.append_null();
                 }
-                *has_value = false;
                 *seconds = 0;
                 *nanos = 0;
             }
             Self::Duration {
                 seconds,
                 nanos,
-                has_value,
                 builder,
                 unit,
                 ..
             } => {
-                if *has_value {
+                if has_value {
                     builder.append_value(convert_seconds_nanos_to_unit(*seconds, *nanos, *unit));
                 } else {
                     builder.append_null();
                 }
-                *has_value = false;
                 *seconds = 0;
                 *nanos = 0;
             }
@@ -1864,10 +1802,9 @@ impl FieldDecoder {
                 year,
                 month,
                 day,
-                has_value,
                 builder,
             } => {
-                if *has_value {
+                if has_value {
                     if *year == 0 && *month == 0 && *day == 0 {
                         builder.append_value(0);
                     } else {
@@ -1876,7 +1813,6 @@ impl FieldDecoder {
                 } else {
                     builder.append_null();
                 }
-                *has_value = false;
                 *year = 0;
                 *month = 0;
                 *day = 0;
@@ -1886,11 +1822,10 @@ impl FieldDecoder {
                 minutes,
                 seconds_val,
                 nanos,
-                has_value,
                 builder,
                 unit,
             } => {
-                if *has_value {
+                if has_value {
                     let total_seconds = i64::from(*hours) * 3600
                         + i64::from(*minutes) * 60
                         + i64::from(*seconds_val);
@@ -1902,140 +1837,92 @@ impl FieldDecoder {
                 } else {
                     builder.append_null();
                 }
-                *has_value = false;
                 *hours = 0;
                 *minutes = 0;
                 *seconds_val = 0;
                 *nanos = 0;
             }
             // Wrapper types: present → value, absent → null
-            Self::WrapperDouble {
-                value,
-                has_value,
-                builder,
-            } => {
-                if *has_value {
+            Self::WrapperDouble { value, builder } => {
+                if has_value {
                     builder.append_value(*value);
                 } else {
                     builder.append_null();
                 }
-                *has_value = false;
                 *value = 0.0;
             }
-            Self::WrapperFloat {
-                value,
-                has_value,
-                builder,
-            } => {
-                if *has_value {
+            Self::WrapperFloat { value, builder } => {
+                if has_value {
                     builder.append_value(*value);
                 } else {
                     builder.append_null();
                 }
-                *has_value = false;
                 *value = 0.0;
             }
-            Self::WrapperInt64 {
-                value,
-                has_value,
-                builder,
-            } => {
-                if *has_value {
+            Self::WrapperInt64 { value, builder } => {
+                if has_value {
                     builder.append_value(*value);
                 } else {
                     builder.append_null();
                 }
-                *has_value = false;
                 *value = 0;
             }
-            Self::WrapperUInt64 {
-                value,
-                has_value,
-                builder,
-            } => {
-                if *has_value {
+            Self::WrapperUInt64 { value, builder } => {
+                if has_value {
                     builder.append_value(*value);
                 } else {
                     builder.append_null();
                 }
-                *has_value = false;
                 *value = 0;
             }
-            Self::WrapperInt32 {
-                value,
-                has_value,
-                builder,
-            } => {
-                if *has_value {
+            Self::WrapperInt32 { value, builder } => {
+                if has_value {
                     builder.append_value(*value);
                 } else {
                     builder.append_null();
                 }
-                *has_value = false;
                 *value = 0;
             }
-            Self::WrapperUInt32 {
-                value,
-                has_value,
-                builder,
-            } => {
-                if *has_value {
+            Self::WrapperUInt32 { value, builder } => {
+                if has_value {
                     builder.append_value(*value);
                 } else {
                     builder.append_null();
                 }
-                *has_value = false;
                 *value = 0;
             }
-            Self::WrapperBool {
-                value,
-                has_value,
-                builder,
-            } => {
-                if *has_value {
+            Self::WrapperBool { value, builder } => {
+                if has_value {
                     builder.append_value(*value);
                 } else {
                     builder.append_null();
                 }
-                *has_value = false;
                 *value = false;
             }
-            Self::WrapperString {
-                value,
-                has_value,
-                builder,
-            } => {
-                if *has_value {
+            Self::WrapperString { value, builder } => {
+                if has_value {
                     builder.append_value(unsafe { std::str::from_utf8_unchecked(value) });
                 } else {
                     builder.append_null();
                 }
-                *has_value = false;
                 value.clear();
             }
-            Self::WrapperBytes {
-                value,
-                has_value,
-                builder,
-            } => {
-                if *has_value {
+            Self::WrapperBytes { value, builder } => {
+                if has_value {
                     builder.append_value(value.as_slice());
                 } else {
                     builder.append_null();
                 }
-                *has_value = false;
                 value.clear();
             }
             // Nested message
             Self::Message {
                 sub_decoder,
-                has_value,
                 is_valid,
             } => {
                 // Absent: every field of the struct gets its default.
-                is_valid.append_value(*has_value);
-                sub_decoder.flush_unseen();
-                *has_value = false;
+                is_valid.append_value(has_value);
+                sub_decoder.flush_row();
             }
             // Repeated fields: push offset
             Self::Repeated { inner, offsets, .. } => {
@@ -2122,6 +2009,7 @@ impl FieldDecoder {
                 offsets,
                 map_value_name,
                 map_value_nullable,
+                ..
             } => {
                 let key_array = key_decoder.finish();
                 let value_array = value_decoder.finish();
@@ -2266,11 +2154,20 @@ bitflags::bitflags! {
     /// Per-field flags of a [`MessageDecoder`].
     #[derive(Clone, Copy)]
     struct FieldFlags: u8 {
-        /// The decoder appended its value directly in the current row (see
-        /// [`FieldDecoder::decode`]).
+        /// The field occurred in the current row (see [`FieldDecoder::decode`]).
         const HAS_VALUE = 1;
         /// [`FieldDescriptor::supports_presence`]: an absent value is null.
         const HAS_PRESENCE = 1 << 1;
+        /// [`FieldDecoder::flush`] runs at the end of every row, not only
+        /// when the field is absent. Set by [`build_field_decoder`].
+        const BUFFERED = 1 << 2;
+    }
+}
+
+impl FieldFlags {
+    /// The end of a row must flush the field: it is absent, or buffered.
+    fn needs_flush(self) -> bool {
+        !self.contains(Self::HAS_VALUE) || self.contains(Self::BUFFERED)
     }
 }
 
@@ -2322,11 +2219,12 @@ impl MessageDecoder {
         let mut max_field_number: u32 = 0;
 
         for field in descriptor.fields() {
-            if let Some(decoder) = build_field_decoder(&field, config, capacity, ancestors) {
+            if let Some((decoder, mut flags)) =
+                build_field_decoder(&field, config, capacity, ancestors)
+            {
                 if field.number() > max_field_number {
                     max_field_number = field.number();
                 }
-                let mut flags = FieldFlags::empty();
                 flags.set(FieldFlags::HAS_PRESENCE, field.supports_presence());
                 decoders.push(DecoderState {
                     decoder,
@@ -2376,7 +2274,7 @@ impl MessageDecoder {
                 pos += skip_field(wire_type, &buf[pos..])?;
             }
         }
-        self.flush_unseen();
+        self.flush_row();
         self.num_rows += 1;
         Ok(())
     }
@@ -2406,9 +2304,9 @@ impl MessageDecoder {
     /// Ends a row: flushes every decoder that did not append its value
     /// directly (see [`FieldDecoder::decode`]) and clears
     /// [`FieldFlags::HAS_VALUE`].
-    fn flush_unseen(&mut self) {
+    fn flush_row(&mut self) {
         for DecoderState { decoder, flags, .. } in &mut self.decoders {
-            if !flags.contains(FieldFlags::HAS_VALUE) {
+            if flags.needs_flush() {
                 decoder.flush(*flags);
             }
             flags.remove(FieldFlags::HAS_VALUE);
@@ -2416,7 +2314,7 @@ impl MessageDecoder {
     }
 
     fn decode_null_row(&mut self) {
-        self.flush_unseen();
+        self.flush_row();
         self.num_rows += 1;
     }
 
@@ -2482,87 +2380,101 @@ impl MessageDecoder {
 // build_field_decoder
 // ---------------------------------------------------------------------------
 
-/// `capacity`: rows to size scalar builders for (0 when unknown).
+/// The decoder for `field`, with [`FieldFlags::BUFFERED`] set where it
+/// needs it. `capacity`: rows to size scalar builders for (0 when unknown).
 fn build_field_decoder(
     field: &FieldDescriptor,
     config: &PtarsConfig,
     capacity: usize,
     ancestors: &mut Vec<String>,
-) -> Option<FieldDecoder> {
+) -> Option<(FieldDecoder, FieldFlags)> {
     if field.is_map() {
-        return build_map_decoder(field, config, ancestors);
+        return Some((
+            build_map_decoder(field, config, ancestors)?,
+            FieldFlags::BUFFERED,
+        ));
     }
     if field.is_list() {
-        return build_repeated_decoder(field, config, ancestors);
+        return Some((
+            build_repeated_decoder(field, config, ancestors)?,
+            FieldFlags::BUFFERED,
+        ));
     }
 
+    let direct = |decoder| Some((decoder, FieldFlags::empty()));
+    let buffered = |decoder| Some((decoder, FieldFlags::BUFFERED));
     match field.kind() {
-        Kind::Int32 => Some(FieldDecoder::Int32 {
+        Kind::Int32 => direct(FieldDecoder::Int32 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Int64 => Some(FieldDecoder::Int64 {
+        Kind::Int64 => direct(FieldDecoder::Int64 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Uint32 => Some(FieldDecoder::UInt32 {
+        Kind::Uint32 => direct(FieldDecoder::UInt32 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Uint64 => Some(FieldDecoder::UInt64 {
+        Kind::Uint64 => direct(FieldDecoder::UInt64 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Sint32 => Some(FieldDecoder::Sint32 {
+        Kind::Sint32 => direct(FieldDecoder::Sint32 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Sint64 => Some(FieldDecoder::Sint64 {
+        Kind::Sint64 => direct(FieldDecoder::Sint64 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Sfixed32 => Some(FieldDecoder::Sfixed32 {
+        Kind::Sfixed32 => direct(FieldDecoder::Sfixed32 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Sfixed64 => Some(FieldDecoder::Sfixed64 {
+        Kind::Sfixed64 => direct(FieldDecoder::Sfixed64 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Fixed32 => Some(FieldDecoder::Fixed32 {
+        Kind::Fixed32 => direct(FieldDecoder::Fixed32 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Fixed64 => Some(FieldDecoder::Fixed64 {
+        Kind::Fixed64 => direct(FieldDecoder::Fixed64 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Float => Some(FieldDecoder::Float {
+        Kind::Float => direct(FieldDecoder::Float {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Double => Some(FieldDecoder::Double {
+        Kind::Double => direct(FieldDecoder::Double {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Bool => Some(FieldDecoder::Bool {
+        Kind::Bool => buffered(FieldDecoder::Bool {
             value: false,
-            has_value: false,
             builder: BooleanBuilder::with_capacity(capacity),
         }),
-        Kind::String => Some(FieldDecoder::String {
+        Kind::String => direct(FieldDecoder::String {
             builder: StringColumn::with_capacity(config.use_large_string, capacity),
         }),
-        Kind::Bytes => Some(FieldDecoder::Bytes {
+        Kind::Bytes => direct(FieldDecoder::Bytes {
             builder: ByteColumn::with_capacity(config.use_large_binary, capacity),
         }),
         Kind::Enum(enum_desc) => match config.enum_repr {
-            EnumRepr::Int32 => Some(FieldDecoder::EnumInt32 {
+            EnumRepr::Int32 => direct(FieldDecoder::EnumInt32 {
                 default: enum_desc.default_value().number(),
                 builder: PrimitiveBuilder::with_capacity(capacity),
             }),
-            EnumRepr::String => Some(FieldDecoder::EnumString {
+            EnumRepr::String => buffered(FieldDecoder::EnumString {
                 value: 0,
-                has_value: false,
                 builder: StringBuilderInner::new(config.use_large_string),
                 enum_names: EnumNames::new(&enum_desc),
             }),
-            EnumRepr::Binary => Some(FieldDecoder::EnumBinary {
+            EnumRepr::Binary => buffered(FieldDecoder::EnumBinary {
                 value: 0,
-                has_value: false,
                 builder: BinaryBuilderInner::new(config.use_large_binary),
                 enum_names: EnumNames::new(&enum_desc),
             }),
         },
-        Kind::Message(msg_desc) => build_message_field_decoder(msg_desc, config, ancestors),
+        Kind::Message(msg_desc) => {
+            let decoder = build_message_field_decoder(msg_desc, config, ancestors)?;
+            // The recursion guard's raw bytes are appended directly, like a bytes field.
+            if matches!(decoder, FieldDecoder::Bytes { .. }) {
+                direct(decoder)
+            } else {
+                buffered(decoder)
+            }
+        }
     }
 }
 
@@ -2575,7 +2487,6 @@ fn build_message_field_decoder(
         "google.protobuf.Timestamp" => Some(FieldDecoder::Timestamp {
             seconds: 0,
             nanos: 0,
-            has_value: false,
             builder: PrimitiveBuilder::new(),
             unit: config.timestamp_unit.into(),
             tz: config.timestamp_tz.clone(),
@@ -2583,7 +2494,6 @@ fn build_message_field_decoder(
         "google.protobuf.Duration" => Some(FieldDecoder::Duration {
             seconds: 0,
             nanos: 0,
-            has_value: false,
             builder: PrimitiveBuilder::new(),
             unit: config.duration_unit.into(),
         }),
@@ -2591,7 +2501,6 @@ fn build_message_field_decoder(
             year: 0,
             month: 0,
             day: 0,
-            has_value: false,
             builder: PrimitiveBuilder::new(),
         }),
         "google.type.TimeOfDay" => Some(FieldDecoder::TimeOfDay {
@@ -2599,53 +2508,43 @@ fn build_message_field_decoder(
             minutes: 0,
             seconds_val: 0,
             nanos: 0,
-            has_value: false,
             builder: PrimitiveBuilder::new(),
             unit: config.time_unit.into(),
         }),
         "google.protobuf.DoubleValue" => Some(FieldDecoder::WrapperDouble {
             value: 0.0,
-            has_value: false,
             builder: PrimitiveBuilder::new(),
         }),
         "google.protobuf.FloatValue" => Some(FieldDecoder::WrapperFloat {
             value: 0.0,
-            has_value: false,
             builder: PrimitiveBuilder::new(),
         }),
         "google.protobuf.Int64Value" => Some(FieldDecoder::WrapperInt64 {
             value: 0,
-            has_value: false,
             builder: PrimitiveBuilder::new(),
         }),
         "google.protobuf.UInt64Value" => Some(FieldDecoder::WrapperUInt64 {
             value: 0,
-            has_value: false,
             builder: PrimitiveBuilder::new(),
         }),
         "google.protobuf.Int32Value" => Some(FieldDecoder::WrapperInt32 {
             value: 0,
-            has_value: false,
             builder: PrimitiveBuilder::new(),
         }),
         "google.protobuf.UInt32Value" => Some(FieldDecoder::WrapperUInt32 {
             value: 0,
-            has_value: false,
             builder: PrimitiveBuilder::new(),
         }),
         "google.protobuf.BoolValue" => Some(FieldDecoder::WrapperBool {
             value: false,
-            has_value: false,
             builder: BooleanBuilder::new(),
         }),
         "google.protobuf.StringValue" => Some(FieldDecoder::WrapperString {
             value: Vec::new(),
-            has_value: false,
             builder: StringBuilderInner::new(config.use_large_string),
         }),
         "google.protobuf.BytesValue" => Some(FieldDecoder::WrapperBytes {
             value: Vec::new(),
-            has_value: false,
             builder: BinaryBuilderInner::new(config.use_large_binary),
         }),
         _ => {
@@ -2659,7 +2558,6 @@ fn build_message_field_decoder(
             let sub_decoder = MessageDecoder::new_inner(&msg_desc, config, 0, ancestors);
             Some(FieldDecoder::Message {
                 sub_decoder: Box::new(sub_decoder),
-                has_value: false,
                 is_valid: BooleanBuilder::new(),
             })
         }
@@ -2841,10 +2739,12 @@ fn build_map_decoder(
     let value_field = map_entry.get_field_by_name("value")?;
 
     // One row per entry; the number of entries is unknown.
-    let key_decoder = build_field_decoder(&key_field, config, 0, ancestors)?;
-    let value_decoder = build_field_decoder(&value_field, config, 0, ancestors)?;
+    let (key_decoder, key_flags) = build_field_decoder(&key_field, config, 0, ancestors)?;
+    let (value_decoder, value_flags) = build_field_decoder(&value_field, config, 0, ancestors)?;
 
     Some(FieldDecoder::Map {
+        key_flags,
+        value_flags,
         key_decoder: Box::new(key_decoder),
         value_decoder: Box::new(value_decoder),
         offsets: vec![0],
