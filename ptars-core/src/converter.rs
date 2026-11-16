@@ -4,7 +4,7 @@ mod tests {
     use crate::config::{EnumRepr, PtarsConfig};
     use crate::proto_to_arrow::{
         binary_array_to_record_batch_direct, messages_to_record_batch,
-        messages_to_record_batch_with_config,
+        messages_to_record_batch_with_config, MessageDecoder,
     };
     use arrow::array::Array;
     use arrow_array::BinaryArray;
@@ -5967,5 +5967,81 @@ mod tests {
             })
             .collect();
         assert_concatenation_merges(&descriptor, &rows, &[PtarsConfig::default()]);
+    }
+
+    /// `map<string, int32> my_map = 1;`
+    fn map_fixture() -> MessageDescriptor {
+        let entry = DescriptorProto {
+            name: Some("MyMapEntry".to_string()),
+            field: vec![
+                scalar_field("key", 1, Type::String),
+                scalar_field("value", 2, Type::Int32),
+            ],
+            options: Some(prost_reflect::prost_types::MessageOptions {
+                map_entry: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let file_descriptor = FileDescriptorProto {
+            name: Some("map.proto".to_string()),
+            package: Some("test".to_string()),
+            syntax: Some("proto3".to_string()),
+            message_type: vec![DescriptorProto {
+                name: Some("WithMap".to_string()),
+                field: vec![FieldDescriptorProto {
+                    label: Some(Label::Repeated.into()),
+                    type_name: Some(".test.WithMap.MyMapEntry".to_string()),
+                    ..scalar_field("my_map", 1, Type::Message)
+                }],
+                nested_type: vec![entry],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        create_pool_with_message(file_descriptor)
+            .get_message_by_name("test.WithMap")
+            .unwrap()
+    }
+
+    /// Decodes `good`, `bad`, `good` with one decoder. Whatever `bad` does,
+    /// the batch must build (every column has three rows) and the good rows
+    /// must match decoding `good` alone. Returns whether `bad` failed.
+    fn decode_around(descriptor: &MessageDescriptor, good: &[u8], bad: &[u8]) -> bool {
+        let config = PtarsConfig::default();
+        let mut decoder = MessageDecoder::new(descriptor, &config);
+        decoder.decode_row(good).unwrap();
+        let failed = decoder.decode_row(bad).is_err();
+        decoder.decode_row(good).unwrap();
+        let batch = decoder.finish();
+        assert_eq!(batch.num_rows(), 3);
+        let mut alone = MessageDecoder::new(descriptor, &config);
+        alone.decode_row(good).unwrap();
+        let expected = alone.finish();
+        assert_eq!(batch.slice(0, 1), expected);
+        assert_eq!(batch.slice(2, 1), expected);
+        failed
+    }
+
+    /// A message that fails partway is still a complete row, so the decoder
+    /// stays usable: every truncation of messages with nested, repeated and
+    /// optional fields, and a map entry failing between its key and value.
+    #[test]
+    fn test_failed_row_keeps_decoder_usable() {
+        let descriptor = merge_fixture();
+        let mut failures = 0;
+        for seed in 0..6 {
+            let message = merge_sample(&descriptor, seed).encode_to_vec();
+            for cut in 0..message.len() {
+                failures += decode_around(&descriptor, &message, &message[..cut]) as usize;
+            }
+        }
+        assert!(failures > 0);
+
+        // Entry {key: "k1", value: 300}; then the same key with a value
+        // varint that never ends inside the entry.
+        let good = [0x0a, 7, 0x0a, 2, b'k', b'1', 0x10, 0xac, 0x02];
+        let bad = [0x0a, 6, 0x0a, 2, b'k', b'1', 0x10, 0xff];
+        assert!(decode_around(&map_fixture(), &good, &bad));
     }
 }

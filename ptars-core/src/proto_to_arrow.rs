@@ -1689,7 +1689,7 @@ impl FieldDecoder {
                 // For simplicity (and matching DynamicMessage behavior), we decode fresh each time.
                 // Reset sub_decoder if already decoded this row.
                 flags.insert(FieldFlags::HAS_VALUE);
-                sub_decoder.decode_message_bytes(data)?;
+                sub_decoder.decode_nested(data)?;
                 Ok(total)
             }
             // Repeated fields — delegate to inner
@@ -1732,24 +1732,29 @@ impl FieldDecoder {
         // Parse entry submessage: field 1 = key, field 2 = value
         let mut pos = 0;
         let (mut key_flags, mut value_flags) = (key_start, value_start);
-        while pos < data.len() {
-            let (fnum, wt, n) = decode_tag(&data[pos..])?;
-            pos += n;
-            if fnum == 1 {
-                pos += key_decoder.decode(wt, &data[pos..], &mut key_flags)?;
-            } else if fnum == 2 {
-                pos += value_decoder.decode(wt, &data[pos..], &mut value_flags)?;
-            } else {
-                pos += skip_field(wt, &data[pos..])?;
+        let entry = (|| -> Result<(), prost::DecodeError> {
+            while pos < data.len() {
+                let (fnum, wt, n) = decode_tag(&data[pos..])?;
+                pos += n;
+                if fnum == 1 {
+                    pos += key_decoder.decode(wt, &data[pos..], &mut key_flags)?;
+                } else if fnum == 2 {
+                    pos += value_decoder.decode(wt, &data[pos..], &mut value_flags)?;
+                } else {
+                    pos += skip_field(wt, &data[pos..])?;
+                }
             }
-        }
+            Ok(())
+        })();
+        // Complete the entry even if it failed, so keys and values stay
+        // aligned (see `MessageDecoder::decode_row`).
         if key_flags.needs_flush() {
             key_decoder.flush(key_flags);
         }
         if value_flags.needs_flush() {
             value_decoder.flush(value_flags);
         }
-        Ok(total)
+        entry.map(|()| total)
     }
 
     /// Ends a row for this field. [`FieldFlags::HAS_VALUE`]: the field
@@ -2221,6 +2226,9 @@ struct DecoderState {
     flags: FieldFlags,
 }
 
+/// Decodes serialized messages of one type into a record batch, one row per
+/// [`MessageDecoder::decode_row`] call; [`MessageDecoder::finish`] returns
+/// the batch.
 pub struct MessageDecoder {
     /// One per field, in field order.
     decoders: Vec<DecoderState>,
@@ -2281,7 +2289,24 @@ impl MessageDecoder {
         }
     }
 
-    fn decode_row(&mut self, buf: &[u8]) -> Result<(), prost::DecodeError> {
+    /// Decodes one serialized message as the next row.
+    ///
+    /// The row is added even if decoding fails: fields decoded before the
+    /// error keep their values and the rest get their defaults (null where
+    /// the field has presence), so the decoder stays usable. Drop the rows
+    /// that failed if only valid messages should remain.
+    pub fn decode_row(&mut self, buf: &[u8]) -> Result<(), prost::DecodeError> {
+        let result = self.decode_fields(buf);
+        self.flush_row();
+        self.num_rows += 1;
+        result
+    }
+
+    /// Decodes a message's fields without ending the row: the end of a row
+    /// for [`MessageDecoder::decode_row`], and the parent's flush for a
+    /// singular message field, which may occur more than once.
+    #[inline(always)]
+    fn decode_fields(&mut self, buf: &[u8]) -> Result<(), prost::DecodeError> {
         let mut pos = 0;
         while pos < buf.len() {
             let (field_num, wire_type, n) = decode_tag(&buf[pos..])?;
@@ -2298,31 +2323,14 @@ impl MessageDecoder {
                 pos += skip_field(wire_type, &buf[pos..])?;
             }
         }
-        self.flush_row();
-        self.num_rows += 1;
         Ok(())
     }
 
-    /// Decode a submessage's bytes without flushing — used for singular message fields
-    /// where the parent will call flush.
-    fn decode_message_bytes(&mut self, buf: &[u8]) -> Result<(), prost::DecodeError> {
-        let mut pos = 0;
-        while pos < buf.len() {
-            let (field_num, wire_type, n) = decode_tag(&buf[pos..])?;
-            pos += n;
-            let idx = if (field_num as usize) < self.tag_map.len() {
-                self.tag_map[field_num as usize]
-            } else {
-                None
-            };
-            if let Some(idx) = idx {
-                let DecoderState { decoder, flags, .. } = &mut self.decoders[idx];
-                pos += decoder.decode(wire_type, &buf[pos..], flags)?;
-            } else {
-                pos += skip_field(wire_type, &buf[pos..])?;
-            }
-        }
-        Ok(())
+    /// [`MessageDecoder::decode_fields`] for a nested message, out of line
+    /// so that only `decode_row` gets the inlined copy.
+    #[inline(never)]
+    fn decode_nested(&mut self, buf: &[u8]) -> Result<(), prost::DecodeError> {
+        self.decode_fields(buf)
     }
 
     /// Ends a row: flushes every decoder that did not append its value
@@ -2337,7 +2345,8 @@ impl MessageDecoder {
         }
     }
 
-    fn decode_null_row(&mut self) {
+    /// Appends a null row: null in fields with presence, defaults elsewhere.
+    pub fn decode_null_row(&mut self) {
         self.flush_row();
         self.num_rows += 1;
     }
