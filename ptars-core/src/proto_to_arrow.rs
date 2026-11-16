@@ -38,7 +38,7 @@ fn decode_varint(buf: &[u8]) -> Result<(u64, usize), prost::DecodeError> {
     match buf.first() {
         // one byte is very common; most field tags, and small values
         Some(&byte) if byte < 0x80 => Ok((byte as u64, 1)),
-        _ => decode_varint_slow(buf),
+        _ => decode_varint_chunk(buf),
     }
 }
 
@@ -51,11 +51,10 @@ fn pack_varint_groups(x: u64) -> u64 {
     (x & 0x0000_0000_0fff_ffff) | ((x & 0x0fff_ffff_0000_0000) >> 4)
 }
 
-/// Multi-byte varints: with 8 bytes available, finds the length and decodes
-/// the first 8 bytes without a branch per byte.
+/// Tries to decode the first 8 bytes without a branching, looping otherwise.
 #[cold]
-fn decode_varint_slow(buf: &[u8]) -> Result<(u64, usize), prost::DecodeError> {
-    let Some(word) = buf.first_chunk::<8>() else {
+fn decode_varint_chunk(buf: &[u8]) -> Result<(u64, usize), prost::DecodeError> {
+    let Some((word, rest)) = buf.split_first_chunk() else {
         return decode_varint_loop(buf);
     };
     let word = u64::from_le_bytes(*word);
@@ -66,12 +65,10 @@ fn decode_varint_slow(buf: &[u8]) -> Result<(u64, usize), prost::DecodeError> {
         return Ok((pack_varint_groups(word & keep), len));
     }
     let low = pack_varint_groups(word);
-    match (buf.get(8), buf.get(9)) {
-        (Some(&b8), _) if b8 < 0x80 => Ok((low | (b8 as u64) << 56, 9)),
-        (Some(&b8), Some(&b9)) if b9 < 0x80 => {
-            Ok((low | ((b8 & 0x7f) as u64) << 56 | (b9 as u64) << 63, 10))
-        }
-        (Some(_), Some(_)) => Err(decode_error("varint too large")),
+    match *rest {
+        [b8, ..] if b8 < 0x80 => Ok((low | (b8 as u64) << 56, 9)),
+        [b8, b9, ..] if b9 < 0x80 => Ok((low | ((b8 & 0x7f) as u64) << 56 | (b9 as u64) << 63, 10)),
+        [_, _, ..] => Err(decode_error("varint too large")),
         _ => Err(decode_error("unexpected EOF in varint")),
     }
 }
@@ -3393,7 +3390,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_varint_slow_matches_loop() {
+    fn decode_varint_matches_loop() {
         let mut values: Vec<u64> = vec![0, 1, 127, 128, u64::MAX, 1 << 63];
         for bits in 0..64 {
             values.extend([(1u64 << bits) - 1, 1u64 << bits, (1u64 << bits) + 1]);
@@ -3402,19 +3399,22 @@ mod tests {
         for v in values {
             let mut enc = Vec::new();
             prost::encoding::encode_varint(v, &mut enc);
-            // Exact length, trailing bytes, and every truncation.
+            // Exact length, a few trailing bytes (fewer than 8 in all take the
+            // byte loop) or many, and every truncation.
+            let mut short = enc.clone();
+            short.extend_from_slice(&[0xff; 2]);
             let mut padded = enc.clone();
             padded.extend_from_slice(&[0xff; 12]);
-            for buf in [&enc[..], &padded[..]] {
-                assert_eq!(decode_varint_slow(buf).unwrap(), (v, enc.len()), "{v}");
+            for buf in [&enc[..], &short[..], &padded[..]] {
+                assert_eq!(decode_varint(buf).unwrap(), (v, enc.len()), "{v}");
                 assert_eq!(decode_varint_loop(buf).unwrap(), (v, enc.len()), "{v}");
             }
             for cut in 0..enc.len() {
-                assert!(decode_varint_slow(&enc[..cut]).is_err(), "{v} cut {cut}");
+                assert!(decode_varint(&enc[..cut]).is_err(), "{v} cut {cut}");
             }
         }
         // Overlong: more than 10 bytes with the continuation bit set.
-        assert!(decode_varint_slow(&[0xff; 11]).is_err());
+        assert!(decode_varint(&[0xff; 11]).is_err());
         assert!(decode_varint_loop(&[0xff; 11]).is_err());
     }
 }
