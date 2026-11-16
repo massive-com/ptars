@@ -20,6 +20,10 @@ use prost_reflect::{EnumDescriptor, FieldDescriptor, Kind, MessageDescriptor};
 
 use crate::config::{ConfluentWirePolicy, EnumRepr, PtarsConfig};
 
+mod column_builder;
+
+use column_builder::validate_utf8;
+
 // ---------------------------------------------------------------------------
 // Wire format decoding primitives
 // ---------------------------------------------------------------------------
@@ -579,7 +583,7 @@ impl RepeatedInner {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                let s = std::str::from_utf8(data).map_err(|_| decode_error("invalid UTF-8"))?;
+                let s = validate_utf8(data)?;
                 values_builder.append_value(s);
                 Ok(total)
             }
@@ -1182,7 +1186,7 @@ fn decode_wrapper_string(buf: &[u8]) -> Result<(Vec<u8>, bool), prost::DecodeErr
         pos += n;
         if fnum == 1 && wt == 2 {
             let (data, consumed) = read_length_delimited(&buf[pos..])?;
-            std::str::from_utf8(data).map_err(|_| decode_error("invalid UTF-8"))?;
+            validate_utf8(data)?;
             val.clear();
             val.extend_from_slice(data);
             found = true;
@@ -1497,7 +1501,7 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                std::str::from_utf8(data).map_err(|_| decode_error("invalid UTF-8"))?;
+                validate_utf8(data)?;
                 value.clear();
                 value.extend_from_slice(data);
                 *has_value = true;
