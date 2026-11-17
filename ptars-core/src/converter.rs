@@ -6264,4 +6264,43 @@ mod tests {
         let (_pool, map) = create_map_descriptor(Type::String, Type::Int32);
         assert!(decode_around(&map, &good, &bad));
     }
+
+    /// A decoder reused through `finish_batch` gives each batch what a fresh
+    /// decoder would: nested messages, lists of both offset sizes, maps and
+    /// an empty batch.
+    #[test]
+    fn test_finish_batch_matches_fresh_decoder() {
+        let merge = merge_fixture();
+        let samples: Vec<Vec<u8>> = (0..6)
+            .map(|seed| merge_sample(&merge, seed).encode_to_vec())
+            .collect();
+        let entry = vec![0x0a, 7, 0x0a, 2, b'k', b'1', 0x10, 0xac, 0x02];
+        let large_lists = PtarsConfig {
+            use_large_list: true,
+            ..PtarsConfig::default()
+        };
+        let (_pool, map) = create_map_descriptor(Type::String, Type::Int32);
+        for config in [PtarsConfig::default(), large_lists] {
+            for (descriptor, batches) in [
+                (
+                    merge.clone(),
+                    vec![samples[..4].to_vec(), Vec::new(), samples[2..].to_vec()],
+                ),
+                (
+                    map.clone(),
+                    vec![vec![entry.clone()], vec![entry.clone(), Vec::new()]],
+                ),
+            ] {
+                let mut reused = MessageDecoder::new(&descriptor, &config);
+                for batch in &batches {
+                    let mut fresh = MessageDecoder::new(&descriptor, &config);
+                    for message in batch {
+                        reused.decode_row(message).unwrap();
+                        fresh.decode_row(message).unwrap();
+                    }
+                    assert_eq!(reused.finish_batch(), fresh.finish());
+                }
+            }
+        }
+    }
 }
