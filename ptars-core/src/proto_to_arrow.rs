@@ -2110,6 +2110,8 @@ pub struct MessageDecoder {
 }
 
 impl MessageDecoder {
+    /// A decoder for messages of type `descriptor`, with every field and
+    /// builders that grow as rows are added.
     pub fn new(descriptor: &MessageDescriptor, config: &PtarsConfig) -> Self {
         Self::with_capacity(descriptor, config, 0)
     }
@@ -2181,10 +2183,12 @@ impl MessageDecoder {
 
     /// Decodes one serialized message as the next row.
     ///
-    /// The row is added even if decoding fails: fields decoded before the
-    /// error keep their values and the rest get their defaults (null where
-    /// the field has presence), so the decoder stays usable. Drop the rows
-    /// that failed if only valid messages should remain.
+    /// An error still ends the row (`flush_row`), so the decoder stays
+    /// usable; drop the failed rows to keep only valid messages.
+    ///
+    /// Panics on a length prefix that overflows `usize`, a `google.type.Date`
+    /// that `NaiveDate::from_ymd_opt` rejects, or an overflow in
+    /// `convert_seconds_nanos_to_unit`.
     pub fn decode_row(&mut self, buf: &[u8]) -> Result<(), prost::DecodeError> {
         let result = self.decode_fields(buf);
         self.flush_row();
@@ -2284,6 +2288,7 @@ impl MessageDecoder {
         )
     }
 
+    /// The decoded rows as a batch, which takes over the builders' buffers.
     pub fn finish(mut self) -> RecordBatch {
         if self.decoders.is_empty() {
             let schema = Arc::new(arrow_schema::Schema::empty());
