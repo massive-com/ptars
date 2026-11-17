@@ -253,8 +253,8 @@ impl StringBuilderInner {
     }
     fn finish(&mut self) -> Arc<dyn Array> {
         match self {
-            Self::Regular(b) => Arc::new(std::mem::take(b).finish()),
-            Self::Large(b) => Arc::new(std::mem::take(b).finish()),
+            Self::Regular(b) => Arc::new(b.finish()),
+            Self::Large(b) => Arc::new(b.finish()),
         }
     }
     fn len(&self) -> usize {
@@ -292,8 +292,8 @@ impl BinaryBuilderInner {
     }
     fn finish(&mut self) -> Arc<dyn Array> {
         match self {
-            Self::Regular(b) => Arc::new(std::mem::take(b).finish()),
-            Self::Large(b) => Arc::new(std::mem::take(b).finish()),
+            Self::Regular(b) => Arc::new(b.finish()),
+            Self::Large(b) => Arc::new(b.finish()),
         }
     }
     fn len(&self) -> usize {
@@ -929,33 +929,25 @@ impl RepeatedInner {
             | Self::Sint32 { values_builder, .. }
             | Self::Sfixed32 { values_builder, .. }
             | Self::EnumInt32 { values_builder, .. }
-            | Self::WrapperInt32 { values_builder, .. } => {
-                Arc::new(std::mem::take(values_builder).finish())
-            }
+            | Self::WrapperInt32 { values_builder, .. } => Arc::new(values_builder.finish()),
             Self::Int64 { values_builder, .. }
             | Self::Sint64 { values_builder, .. }
             | Self::Sfixed64 { values_builder, .. }
-            | Self::WrapperInt64 { values_builder, .. } => {
-                Arc::new(std::mem::take(values_builder).finish())
-            }
+            | Self::WrapperInt64 { values_builder, .. } => Arc::new(values_builder.finish()),
             Self::UInt32 { values_builder, .. }
             | Self::Fixed32 { values_builder, .. }
-            | Self::WrapperUInt32 { values_builder, .. } => {
-                Arc::new(std::mem::take(values_builder).finish())
-            }
+            | Self::WrapperUInt32 { values_builder, .. } => Arc::new(values_builder.finish()),
             Self::UInt64 { values_builder, .. }
             | Self::Fixed64 { values_builder, .. }
-            | Self::WrapperUInt64 { values_builder, .. } => {
-                Arc::new(std::mem::take(values_builder).finish())
-            }
+            | Self::WrapperUInt64 { values_builder, .. } => Arc::new(values_builder.finish()),
             Self::Float { values_builder, .. } | Self::WrapperFloat { values_builder, .. } => {
-                Arc::new(std::mem::take(values_builder).finish())
+                Arc::new(values_builder.finish())
             }
             Self::Double { values_builder, .. } | Self::WrapperDouble { values_builder, .. } => {
-                Arc::new(std::mem::take(values_builder).finish())
+                Arc::new(values_builder.finish())
             }
             Self::Bool { values_builder, .. } | Self::WrapperBool { values_builder, .. } => {
-                Arc::new(std::mem::take(values_builder).finish())
+                Arc::new(values_builder.finish())
             }
             Self::String { values_builder, .. }
             | Self::EnumString { values_builder, .. }
@@ -973,7 +965,7 @@ impl RepeatedInner {
                 values_builder,
                 unit,
             } => finish_duration(values_builder, *unit),
-            Self::Date { values_builder, .. } => Arc::new(std::mem::take(values_builder).finish()),
+            Self::Date { values_builder, .. } => Arc::new(values_builder.finish()),
             Self::TimeOfDay {
                 values_builder,
                 unit,
@@ -1377,7 +1369,7 @@ macro_rules! flush_primitive {
 }
 
 fn finish_primitive<T: ArrowPrimitiveType>(builder: &mut PrimitiveBuilder<T>) -> Arc<dyn Array> {
-    Arc::new(std::mem::take(builder).finish())
+    Arc::new(builder.finish())
 }
 
 fn finish_timestamp(
@@ -1385,7 +1377,7 @@ fn finish_timestamp(
     unit: TimeUnit,
     tz: &Option<Arc<str>>,
 ) -> Arc<dyn Array> {
-    let values = std::mem::take(builder).finish();
+    let values = builder.finish();
     let dt = DataType::Timestamp(unit, tz.clone());
     let data = ArrayData::builder(dt)
         .len(values.len())
@@ -1397,7 +1389,7 @@ fn finish_timestamp(
 }
 
 fn finish_duration(builder: &mut PrimitiveBuilder<Int64Type>, unit: TimeUnit) -> Arc<dyn Array> {
-    let values = std::mem::take(builder).finish();
+    let values = builder.finish();
     let dt = DataType::Duration(unit);
     let data = ArrayData::builder(dt)
         .len(values.len())
@@ -1409,7 +1401,7 @@ fn finish_duration(builder: &mut PrimitiveBuilder<Int64Type>, unit: TimeUnit) ->
 }
 
 fn finish_time_of_day(builder: &mut PrimitiveBuilder<Int64Type>, unit: TimeUnit) -> Arc<dyn Array> {
-    let values = std::mem::take(builder).finish();
+    let values = builder.finish();
     let dt = match unit {
         TimeUnit::Second => DataType::Time32(TimeUnit::Second),
         TimeUnit::Millisecond => DataType::Time32(TimeUnit::Millisecond),
@@ -2279,7 +2271,7 @@ impl FieldDecoder {
             Self::Fixed64 { builder, .. } => finish_primitive(builder),
             Self::Float { builder, .. } => finish_primitive(builder),
             Self::Double { builder, .. } => finish_primitive(builder),
-            Self::Bool { builder, .. } => Arc::new(std::mem::take(builder).finish()),
+            Self::Bool { builder, .. } => Arc::new(builder.finish()),
             Self::String { builder, .. } => builder.finish(),
             Self::EnumString { builder, .. } => builder.finish(),
             Self::Bytes { builder, .. } => builder.finish(),
@@ -2296,14 +2288,14 @@ impl FieldDecoder {
             Self::WrapperUInt64 { builder, .. } => finish_primitive(builder),
             Self::WrapperInt32 { builder, .. } => finish_primitive(builder),
             Self::WrapperUInt32 { builder, .. } => finish_primitive(builder),
-            Self::WrapperBool { builder, .. } => Arc::new(std::mem::take(builder).finish()),
+            Self::WrapperBool { builder, .. } => Arc::new(builder.finish()),
             Self::WrapperString { builder, .. } => builder.finish(),
             Self::WrapperBytes { builder, .. } => builder.finish(),
             Self::Message {
                 sub_decoder,
                 is_valid,
                 ..
-            } => Arc::new(sub_decoder.build_struct_array(Some(std::mem::take(is_valid).finish()))),
+            } => Arc::new(sub_decoder.build_struct_array(Some(is_valid.finish()))),
             Self::Repeated {
                 inner,
                 offsets,
