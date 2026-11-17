@@ -83,8 +83,9 @@ impl ByteColumn {
     }
 
     /// Builds a binary array, large or not as configured.
-    pub(super) fn finish(&mut self) -> Arc<dyn Array> {
-        let (offsets, values, nulls) = self.take_parts();
+    /// Leaves the column sized for `capacity` rows, as [`Self::with_capacity`].
+    pub(super) fn finish(&mut self, capacity: usize) -> Arc<dyn Array> {
+        let (offsets, values, nulls) = self.take_parts(capacity);
         if self.large {
             let offsets = OffsetBuffer::new(offsets.into());
             Arc::new(LargeBinaryArray::new(offsets, values, nulls))
@@ -94,8 +95,10 @@ impl ByteColumn {
     }
 
     /// The offsets, values and nulls so far; the column is left empty.
-    fn take_parts(&mut self) -> (Vec<i64>, Buffer, Option<NullBuffer>) {
-        let offsets = std::mem::replace(&mut self.offsets, vec![0]);
+    fn take_parts(&mut self, capacity: usize) -> (Vec<i64>, Buffer, Option<NullBuffer>) {
+        let mut next_offsets = Vec::with_capacity(capacity + 1);
+        next_offsets.push(0);
+        let offsets = std::mem::replace(&mut self.offsets, next_offsets);
         let values = Buffer::from_vec(std::mem::take(&mut self.values));
         (offsets, values, self.nulls.finish())
     }
@@ -139,8 +142,9 @@ impl StringColumn {
     }
 
     /// Builds a string array, large or not as configured.
-    pub(super) fn finish(&mut self) -> Arc<dyn Array> {
-        let (offsets, values, nulls) = self.0.take_parts();
+    /// Leaves the column sized for `capacity` rows, as [`Self::with_capacity`].
+    pub(super) fn finish(&mut self, capacity: usize) -> Arc<dyn Array> {
+        let (offsets, values, nulls) = self.0.take_parts(capacity);
         // SAFETY: only `&str` values were pushed, so every value is UTF-8.
         if self.0.large {
             let offsets = OffsetBuffer::new(offsets.into());
