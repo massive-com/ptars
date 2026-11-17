@@ -2167,10 +2167,10 @@ impl FieldDecoder {
         }
     }
 
-    fn finish(&mut self, nullable: bool) -> (Field, Arc<dyn Array>) {
-        // This is called by MessageDecoder::finish, which provides the field name separately
-        // We return a dummy field name here; the caller replaces it.
-        let array: Arc<dyn Array> = match self {
+    /// The column decoded so far; the builders are left empty. The caller
+    /// names the field.
+    fn finish(&mut self) -> Arc<dyn Array> {
+        match self {
             Self::Int32 { builder, .. } | Self::EnumInt32 { builder, .. } => {
                 finish_primitive(builder)
             }
@@ -2232,8 +2232,8 @@ impl FieldDecoder {
                 map_value_name,
                 map_value_nullable,
             } => {
-                let (_, key_array) = key_decoder.finish(false);
-                let (_, value_array) = value_decoder.finish(*map_value_nullable);
+                let key_array = key_decoder.finish();
+                let value_array = value_decoder.finish();
                 let key_field = Arc::new(Field::new("key", key_array.data_type().clone(), false));
                 let value_field = Arc::new(Field::new(
                     &**map_value_name,
@@ -2259,9 +2259,7 @@ impl FieldDecoder {
                     .unwrap();
                 Arc::new(MapArray::from(map_data))
             }
-        };
-        let field = Field::new("", array.data_type().clone(), nullable);
-        (field, array)
+        }
     }
 }
 
@@ -2562,7 +2560,7 @@ impl MessageDecoder {
                     } else {
                         field_desc.supports_presence()
                     };
-                    let (_, array) = decoder.finish(nullable);
+                    let array = decoder.finish();
                     let field = Field::new(field_desc.name(), array.data_type().clone(), nullable);
                     (field, array)
                 },
