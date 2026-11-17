@@ -6121,7 +6121,8 @@ mod tests {
                     ],
                 ),
             ] {
-                let mut reused = MessageDecoder::new(&descriptor, &config);
+                // Presized, so finish_batch sizes its builders again.
+                let mut reused = MessageDecoder::with_capacity(&descriptor, &config, 4);
                 for batch in &batches {
                     let mut fresh = MessageDecoder::new(&descriptor, &config);
                     for message in batch {

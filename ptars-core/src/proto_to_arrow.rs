@@ -369,8 +369,9 @@ impl ByteColumn {
     }
 
     /// Builds a binary array, large or not as configured.
-    fn finish(&mut self) -> Arc<dyn Array> {
-        let (offsets, values, nulls) = self.take_parts();
+    /// Leaves the column sized for `capacity` rows, as [`Self::with_capacity`].
+    fn finish(&mut self, capacity: usize) -> Arc<dyn Array> {
+        let (offsets, values, nulls) = self.take_parts(capacity);
         if self.large {
             let offsets = OffsetBuffer::new(offsets.into());
             Arc::new(LargeBinaryArray::new(offsets, values, nulls))
@@ -380,8 +381,10 @@ impl ByteColumn {
     }
 
     /// The offsets, values and nulls so far; the column is left empty.
-    fn take_parts(&mut self) -> (Vec<i64>, Buffer, Option<NullBuffer>) {
-        let offsets = std::mem::replace(&mut self.offsets, vec![0]);
+    fn take_parts(&mut self, capacity: usize) -> (Vec<i64>, Buffer, Option<NullBuffer>) {
+        let mut next_offsets = Vec::with_capacity(capacity + 1);
+        next_offsets.push(0);
+        let offsets = std::mem::replace(&mut self.offsets, next_offsets);
         let values = Buffer::from_vec(std::mem::take(&mut self.values));
         (offsets, values, self.nulls.finish())
     }
@@ -429,8 +432,9 @@ impl StringColumn {
     }
 
     /// Builds a string array, large or not as configured.
-    fn finish(&mut self) -> Arc<dyn Array> {
-        let (offsets, values, nulls) = self.0.take_parts();
+    /// Leaves the column sized for `capacity` rows, as [`Self::with_capacity`].
+    fn finish(&mut self, capacity: usize) -> Arc<dyn Array> {
+        let (offsets, values, nulls) = self.0.take_parts(capacity);
         // SAFETY: only `&str` values were pushed, so every value is UTF-8.
         if self.0.large {
             let offsets = OffsetBuffer::new(offsets.into());
@@ -954,7 +958,9 @@ impl RepeatedInner {
             Self::Bytes { values_builder, .. }
             | Self::EnumBinary { values_builder, .. }
             | Self::WrapperBytes { values_builder, .. } => values_builder.finish(),
-            Self::Message { sub_decoder, .. } => Arc::new(sub_decoder.build_struct_array(None)),
+            Self::Message { sub_decoder, .. } => {
+                Arc::new(sub_decoder.build_struct_array(None, false))
+            }
             Self::Timestamp {
                 values_builder,
                 unit,
@@ -1317,8 +1323,16 @@ fn append_absent<T: ArrowPrimitiveType>(builder: &mut PrimitiveBuilder<T>, has_p
     }
 }
 
-fn finish_primitive<T: ArrowPrimitiveType>(builder: &mut PrimitiveBuilder<T>) -> Arc<dyn Array> {
-    Arc::new(builder.finish())
+/// Finishes `builder`, leaving it sized for `capacity` rows (empty for 0).
+fn finish_primitive<T: ArrowPrimitiveType>(
+    builder: &mut PrimitiveBuilder<T>,
+    capacity: usize,
+) -> Arc<dyn Array> {
+    let array = builder.finish();
+    if capacity > 0 {
+        *builder = PrimitiveBuilder::with_capacity(capacity);
+    }
+    Arc::new(array)
 }
 
 fn finish_timestamp(
@@ -1976,51 +1990,58 @@ impl FieldDecoder {
         }
     }
 
-    /// The column decoded so far; the builders are left empty. The caller
+    /// The column decoded so far. Builders that [`MessageDecoder::with_capacity`]
+    /// sizes are left sized for `capacity` rows, the rest empty. The caller
     /// names the field.
-    fn finish(&mut self) -> Arc<dyn Array> {
+    fn finish(&mut self, capacity: usize) -> Arc<dyn Array> {
         match self {
             Self::Int32 { builder, .. } | Self::EnumInt32 { builder, .. } => {
-                finish_primitive(builder)
+                finish_primitive(builder, capacity)
             }
-            Self::Int64 { builder, .. } => finish_primitive(builder),
-            Self::UInt32 { builder, .. } => finish_primitive(builder),
-            Self::UInt64 { builder, .. } => finish_primitive(builder),
+            Self::Int64 { builder, .. } => finish_primitive(builder, capacity),
+            Self::UInt32 { builder, .. } => finish_primitive(builder, capacity),
+            Self::UInt64 { builder, .. } => finish_primitive(builder, capacity),
             Self::Sint32 { builder, .. } | Self::Sfixed32 { builder, .. } => {
-                finish_primitive(builder)
+                finish_primitive(builder, capacity)
             }
             Self::Sint64 { builder, .. } | Self::Sfixed64 { builder, .. } => {
-                finish_primitive(builder)
+                finish_primitive(builder, capacity)
             }
-            Self::Fixed32 { builder, .. } => finish_primitive(builder),
-            Self::Fixed64 { builder, .. } => finish_primitive(builder),
-            Self::Float { builder, .. } => finish_primitive(builder),
-            Self::Double { builder, .. } => finish_primitive(builder),
-            Self::Bool { builder, .. } => Arc::new(builder.finish()),
-            Self::String { builder, .. } => builder.finish(),
-            Self::EnumString { builder, .. } => builder.finish(),
-            Self::Bytes { builder, .. } => builder.finish(),
-            Self::EnumBinary { builder, .. } => builder.finish(),
+            Self::Fixed32 { builder, .. } => finish_primitive(builder, capacity),
+            Self::Fixed64 { builder, .. } => finish_primitive(builder, capacity),
+            Self::Float { builder, .. } => finish_primitive(builder, capacity),
+            Self::Double { builder, .. } => finish_primitive(builder, capacity),
+            Self::Bool { builder, .. } => {
+                let array = builder.finish();
+                if capacity > 0 {
+                    *builder = BooleanBuilder::with_capacity(capacity);
+                }
+                Arc::new(array)
+            }
+            Self::String { builder, .. } => builder.finish(capacity),
+            Self::EnumString { builder, .. } => builder.finish(capacity),
+            Self::Bytes { builder, .. } => builder.finish(capacity),
+            Self::EnumBinary { builder, .. } => builder.finish(capacity),
             Self::Timestamp {
                 builder, unit, tz, ..
             } => finish_timestamp(builder, *unit, tz),
             Self::Duration { builder, unit, .. } => finish_duration(builder, *unit),
-            Self::Date { builder, .. } => finish_primitive(builder),
+            Self::Date { builder, .. } => finish_primitive(builder, 0),
             Self::TimeOfDay { builder, unit, .. } => finish_time_of_day(builder, *unit),
-            Self::WrapperDouble { builder, .. } => finish_primitive(builder),
-            Self::WrapperFloat { builder, .. } => finish_primitive(builder),
-            Self::WrapperInt64 { builder, .. } => finish_primitive(builder),
-            Self::WrapperUInt64 { builder, .. } => finish_primitive(builder),
-            Self::WrapperInt32 { builder, .. } => finish_primitive(builder),
-            Self::WrapperUInt32 { builder, .. } => finish_primitive(builder),
+            Self::WrapperDouble { builder, .. } => finish_primitive(builder, 0),
+            Self::WrapperFloat { builder, .. } => finish_primitive(builder, 0),
+            Self::WrapperInt64 { builder, .. } => finish_primitive(builder, 0),
+            Self::WrapperUInt64 { builder, .. } => finish_primitive(builder, 0),
+            Self::WrapperInt32 { builder, .. } => finish_primitive(builder, 0),
+            Self::WrapperUInt32 { builder, .. } => finish_primitive(builder, 0),
             Self::WrapperBool { builder, .. } => Arc::new(builder.finish()),
-            Self::WrapperString { builder, .. } => builder.finish(),
-            Self::WrapperBytes { builder, .. } => builder.finish(),
+            Self::WrapperString { builder, .. } => builder.finish(0),
+            Self::WrapperBytes { builder, .. } => builder.finish(0),
             Self::Message {
                 sub_decoder,
                 is_valid,
                 ..
-            } => Arc::new(sub_decoder.build_struct_array(Some(is_valid.finish()))),
+            } => Arc::new(sub_decoder.build_struct_array(Some(is_valid.finish()), capacity > 0)),
             Self::Repeated {
                 inner,
                 offsets,
@@ -2061,8 +2082,8 @@ impl FieldDecoder {
         map_value_name: &str,
         map_value_nullable: bool,
     ) -> Arc<dyn Array> {
-        let key_array = key_decoder.finish();
-        let value_array = value_decoder.finish();
+        let key_array = key_decoder.finish(0);
+        let value_array = value_decoder.finish(0);
         let key_field = Arc::new(Field::new("key", key_array.data_type().clone(), false));
         let value_field = Arc::new(Field::new(
             map_value_name,
@@ -2237,6 +2258,7 @@ pub struct MessageDecoder {
     list_nullable: bool,
     map_nullable: bool,
     num_rows: usize,
+    capacity: usize,
     fields: Option<Fields>,
 }
 
@@ -2290,6 +2312,7 @@ impl MessageDecoder {
             list_nullable: config.list_nullable,
             map_nullable: config.map_nullable,
             num_rows: 0,
+            capacity,
             fields: None,
         }
     }
@@ -2366,7 +2389,13 @@ impl MessageDecoder {
         self.num_rows
     }
 
-    fn build_struct_array(&mut self, validity: Option<arrow_array::BooleanArray>) -> StructArray {
+    /// `presize`: leave the builders sized for this decoder's capacity.
+    fn build_struct_array(
+        &mut self,
+        validity: Option<arrow_array::BooleanArray>,
+        presize: bool,
+    ) -> StructArray {
+        let capacity = if presize { self.capacity } else { 0 };
         // Rows of a repeated message field are counted here; the next batch
         // starts again from zero.
         let num_rows = std::mem::take(&mut self.num_rows);
@@ -2381,7 +2410,7 @@ impl MessageDecoder {
         let columns: Vec<Arc<dyn Array>> = self
             .decoders
             .iter_mut()
-            .map(|DecoderState { decoder, .. }| decoder.finish())
+            .map(|DecoderState { decoder, .. }| decoder.finish(capacity))
             .collect();
 
         let fields = self.fields.get_or_insert_with(|| {
@@ -2410,14 +2439,20 @@ impl MessageDecoder {
 
     /// The decoded rows as a batch, which takes over the builders' buffers.
     pub fn finish(mut self) -> RecordBatch {
-        self.finish_batch()
+        self.finish_rows(false)
     }
 
     /// Returns the rows decoded since the last call as a batch and leaves
     /// the decoder ready for the next batch, so one decoder can serve many
-    /// batches without being rebuilt. Its builders start the next batch
-    /// empty, without the capacity [`MessageDecoder::with_capacity`] gave.
+    /// batches without being rebuilt. Builders that
+    /// [`MessageDecoder::with_capacity`] sizes are sized for the same number
+    /// of rows again; the rest start empty.
     pub fn finish_batch(&mut self) -> RecordBatch {
+        self.finish_rows(true)
+    }
+
+    /// `presize`: see [`MessageDecoder::build_struct_array`].
+    fn finish_rows(&mut self, presize: bool) -> RecordBatch {
         let num_rows = std::mem::take(&mut self.num_rows);
         if self.decoders.is_empty() {
             let schema = Arc::new(arrow_schema::Schema::empty());
@@ -2428,7 +2463,7 @@ impl MessageDecoder {
             )
             .unwrap();
         }
-        let struct_array = self.build_struct_array(None);
+        let struct_array = self.build_struct_array(None, presize);
         RecordBatch::from(struct_array)
     }
 }
