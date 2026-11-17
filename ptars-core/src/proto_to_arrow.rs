@@ -21,8 +21,10 @@ use prost_reflect::{EnumDescriptor, FieldDescriptor, Kind, MessageDescriptor};
 use crate::config::{ConfluentWirePolicy, EnumRepr, PtarsConfig};
 
 mod column_builder;
+mod wire_types;
 
 use column_builder::{validate_utf8, ByteColumn, StringColumn};
+use wire_types::WireTypes;
 
 // ---------------------------------------------------------------------------
 // Wire format decoding primitives
@@ -2113,6 +2115,8 @@ struct DecoderState {
     decoder: FieldDecoder,
     field: FieldDescriptor,
     flags: FieldFlags,
+    /// [`WireTypes::ALL`] unless [`PtarsConfig::strict_wire_types`].
+    wire_types: WireTypes,
 }
 
 /// Decodes serialized messages of one type into a record batch, one row per
@@ -2171,6 +2175,11 @@ impl MessageDecoder {
                 }
                 flags.set(FieldFlags::HAS_PRESENCE, field.supports_presence());
                 decoders.push(DecoderState {
+                    wire_types: if config.strict_wire_types {
+                        WireTypes::of(&field)
+                    } else {
+                        WireTypes::ALL
+                    },
                     decoder,
                     field,
                     flags,
@@ -2233,7 +2242,13 @@ impl MessageDecoder {
                 None
             };
             if let Some(idx) = idx {
-                let DecoderState { decoder, flags, .. } = &mut self.decoders[idx];
+                let DecoderState {
+                    decoder,
+                    flags,
+                    wire_types,
+                    ..
+                } = &mut self.decoders[idx];
+                wire_types.check(field_num, wire_type)?;
                 pos += decoder.decode(wire_type, &buf[pos..], flags)?;
             } else {
                 pos += skip_field(wire_type, &buf[pos..])?;

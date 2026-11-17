@@ -6280,7 +6280,8 @@ mod tests {
             ..PtarsConfig::default()
         };
         let (_pool, map) = create_map_descriptor(Type::String, Type::Int32);
-        for config in [PtarsConfig::default(), large_lists] {
+        let strict = PtarsConfig::default().with_strict_wire_types(true);
+        for config in [PtarsConfig::default(), large_lists, strict] {
             for (descriptor, batches) in [
                 (
                     merge.clone(),
@@ -6303,5 +6304,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A proto3 message `test.{name}` with `fields`.
+    fn message_of(name: &str, fields: Vec<FieldDescriptorProto>) -> MessageDescriptor {
+        let file_descriptor = FileDescriptorProto {
+            name: Some(format!("{name}.proto")),
+            package: Some("test".to_string()),
+            syntax: Some("proto3".to_string()),
+            message_type: vec![DescriptorProto {
+                name: Some(name.to_string()),
+                field: fields,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        create_pool_with_message(file_descriptor)
+            .get_message_by_name(&format!("test.{name}"))
+            .unwrap()
+    }
+
+    /// With `strict_wire_types`, a known field with a wire type its type
+    /// can't use fails the message, as in prost; without it, the field is
+    /// skipped. Packed and unpacked repeated fields are both fine.
+    #[test]
+    fn test_strict_wire_types() {
+        let descriptor = message_of(
+            "Strict",
+            vec![
+                scalar_field("a", 1, Type::Int32),
+                FieldDescriptorProto {
+                    label: Some(Label::Repeated.into()),
+                    ..scalar_field("r", 2, Type::Int32)
+                },
+            ],
+        );
+        let decode = |strict: bool, message: &[u8]| {
+            let config = PtarsConfig::default().with_strict_wire_types(strict);
+            let mut decoder = MessageDecoder::new(&descriptor, &config);
+            let ok = decoder.decode_row(message).is_ok();
+            (ok, decoder.finish())
+        };
+        // a = 7 as a varint, r = [1, 2] packed, then r = 3 unpacked.
+        let valid = [0x08, 7, 0x12, 2, 1, 2, 0x10, 3];
+        // a sent length-delimited: 0x0a = field 1, wire type 2.
+        let mismatched = [0x0a, 1, 7];
+
+        assert_eq!(decode(true, &valid), (true, decode(false, &valid).1));
+        // Skipped, the field decodes as if absent.
+        assert_eq!(decode(false, &mismatched), (true, decode(false, &[]).1));
+        assert!(!decode(true, &mismatched).0);
     }
 }
