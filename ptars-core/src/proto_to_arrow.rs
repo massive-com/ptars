@@ -31,6 +31,43 @@ fn decode_error(msg: impl Into<Cow<'static, str>>) -> prost::DecodeError {
     prost::DecodeError::new(msg)
 }
 
+#[cold]
+fn wire_type_error(field_number: u32, wire_type: u8) -> prost::DecodeError {
+    decode_error(format!(
+        "field {field_number} has wire type {wire_type}, which its type can't use"
+    ))
+}
+
+/// The wire types `field` can arrive with, one bit per wire type: its
+/// type's own, and length-delimited too for a repeated field (packed).
+fn accepted_wire_types(field: &FieldDescriptor) -> u8 {
+    const VARINT: u8 = 1 << 0;
+    const I64: u8 = 1 << 1;
+    const LEN: u8 = 1 << 2;
+    const I32: u8 = 1 << 5;
+    if field.is_map() {
+        return LEN;
+    }
+    let own = match field.kind() {
+        Kind::Double | Kind::Fixed64 | Kind::Sfixed64 => I64,
+        Kind::Float | Kind::Fixed32 | Kind::Sfixed32 => I32,
+        Kind::String | Kind::Bytes | Kind::Message(_) => LEN,
+        Kind::Int32
+        | Kind::Int64
+        | Kind::Uint32
+        | Kind::Uint64
+        | Kind::Sint32
+        | Kind::Sint64
+        | Kind::Bool
+        | Kind::Enum(_) => VARINT,
+    };
+    if field.is_list() {
+        own | LEN
+    } else {
+        own
+    }
+}
+
 #[inline(always)]
 fn decode_varint(buf: &[u8]) -> Result<(u64, usize), prost::DecodeError> {
     match buf.first() {
@@ -2246,6 +2283,9 @@ struct DecoderState {
     decoder: FieldDecoder,
     field: FieldDescriptor,
     flags: FieldFlags,
+    /// Bit `n` set: the field may arrive with wire type `n`. All set unless
+    /// [`PtarsConfig::strict_wire_types`].
+    wire_types: u8,
 }
 
 /// Decodes serialized messages of one type into a record batch, one row per
@@ -2286,6 +2326,11 @@ impl MessageDecoder {
                 }
                 flags.set(FieldFlags::HAS_PRESENCE, field.supports_presence());
                 decoders.push(DecoderState {
+                    wire_types: if config.strict_wire_types {
+                        accepted_wire_types(&field)
+                    } else {
+                        u8::MAX
+                    },
                     decoder,
                     field,
                     flags,
@@ -2351,7 +2396,15 @@ impl MessageDecoder {
                 None
             };
             if let Some(idx) = idx {
-                let DecoderState { decoder, flags, .. } = &mut self.decoders[idx];
+                let DecoderState {
+                    decoder,
+                    flags,
+                    wire_types,
+                    ..
+                } = &mut self.decoders[idx];
+                if *wire_types & (1 << wire_type) == 0 {
+                    return Err(wire_type_error(field_num, wire_type));
+                }
                 pos += decoder.decode(wire_type, &buf[pos..], flags)?;
             } else {
                 pos += skip_field(wire_type, &buf[pos..])?;

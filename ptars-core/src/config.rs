@@ -107,6 +107,11 @@ pub struct PtarsConfig {
 
     /// Policy for stripping Confluent Schema Registry wire format prefix. Default: Raw
     pub confluent_wire_policy: ConfluentWirePolicy,
+
+    /// Whether a known field that arrives with a wire type its type can't
+    /// use is a decode error, as in prost. Otherwise the field is skipped
+    /// like an unknown one. Default: false
+    pub strict_wire_types: bool,
 }
 
 impl Default for PtarsConfig {
@@ -127,6 +132,7 @@ impl Default for PtarsConfig {
             use_large_list: false,
             enum_repr: EnumRepr::default(),
             confluent_wire_policy: ConfluentWirePolicy::default(),
+            strict_wire_types: false,
         }
     }
 }
@@ -224,6 +230,13 @@ impl PtarsConfig {
     /// Set the Confluent Schema Registry wire format policy.
     pub fn with_confluent_wire_policy(mut self, policy: ConfluentWirePolicy) -> Self {
         self.confluent_wire_policy = policy;
+        self
+    }
+
+    /// Set whether a known field with a wire type its type can't use is a
+    /// decode error.
+    pub fn with_strict_wire_types(mut self, strict: bool) -> Self {
+        self.strict_wire_types = strict;
         self
     }
 }
