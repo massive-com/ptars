@@ -5969,6 +5969,49 @@ mod tests {
         assert_concatenation_merges(&descriptor, &rows, &[PtarsConfig::default()]);
     }
 
+    /// `repeated Inner items = 1; Holder holder = 2;` with `Inner { int32 x = 1; }`
+    /// and `Holder { repeated Inner items = 1; }`: lists of messages at the
+    /// top level and inside a singular message.
+    fn repeated_message_fixture() -> MessageDescriptor {
+        let items = FieldDescriptorProto {
+            label: Some(Label::Repeated.into()),
+            type_name: Some(".test.Inner".to_string()),
+            ..scalar_field("items", 1, Type::Message)
+        };
+        let file_descriptor = FileDescriptorProto {
+            name: Some("repeated_message.proto".to_string()),
+            package: Some("test".to_string()),
+            syntax: Some("proto3".to_string()),
+            message_type: vec![
+                DescriptorProto {
+                    name: Some("Inner".to_string()),
+                    field: vec![scalar_field("x", 1, Type::Int32)],
+                    ..Default::default()
+                },
+                DescriptorProto {
+                    name: Some("Holder".to_string()),
+                    field: vec![items.clone()],
+                    ..Default::default()
+                },
+                DescriptorProto {
+                    name: Some("Outer".to_string()),
+                    field: vec![
+                        items,
+                        FieldDescriptorProto {
+                            type_name: Some(".test.Holder".to_string()),
+                            ..scalar_field("holder", 2, Type::Message)
+                        },
+                    ],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        create_pool_with_message(file_descriptor)
+            .get_message_by_name("test.Outer")
+            .unwrap()
+    }
+
     /// `map<string, int32> my_map = 1;`
     fn map_fixture() -> MessageDescriptor {
         let entry = DescriptorProto {
@@ -6043,5 +6086,51 @@ mod tests {
         let good = [0x0a, 7, 0x0a, 2, b'k', b'1', 0x10, 0xac, 0x02];
         let bad = [0x0a, 6, 0x0a, 2, b'k', b'1', 0x10, 0xff];
         assert!(decode_around(&map_fixture(), &good, &bad));
+    }
+
+    /// A decoder reused through `finish_batch` gives each batch what a fresh
+    /// decoder would: nested messages, lists of both offset sizes, maps and
+    /// an empty batch.
+    #[test]
+    fn test_finish_batch_matches_fresh_decoder() {
+        let merge = merge_fixture();
+        let samples: Vec<Vec<u8>> = (0..6)
+            .map(|seed| merge_sample(&merge, seed).encode_to_vec())
+            .collect();
+        let entry = vec![0x0a, 7, 0x0a, 2, b'k', b'1', 0x10, 0xac, 0x02];
+        let large_lists = PtarsConfig {
+            use_large_list: true,
+            ..PtarsConfig::default()
+        };
+        for config in [PtarsConfig::default(), large_lists] {
+            for (descriptor, batches) in [
+                (
+                    merge.clone(),
+                    vec![samples[..4].to_vec(), Vec::new(), samples[2..].to_vec()],
+                ),
+                (
+                    map_fixture(),
+                    vec![vec![entry.clone()], vec![entry.clone(), Vec::new()]],
+                ),
+                (
+                    repeated_message_fixture(),
+                    vec![
+                        // items {x: 1} items {x: 2}, and holder { items {x: 3} }
+                        vec![vec![0x0a, 2, 0x08, 1, 0x0a, 2, 0x08, 2]],
+                        vec![vec![0x12, 4, 0x0a, 2, 0x08, 3], vec![0x0a, 0]],
+                    ],
+                ),
+            ] {
+                let mut reused = MessageDecoder::new(&descriptor, &config);
+                for batch in &batches {
+                    let mut fresh = MessageDecoder::new(&descriptor, &config);
+                    for message in batch {
+                        reused.decode_row(message).unwrap();
+                        fresh.decode_row(message).unwrap();
+                    }
+                    assert_eq!(reused.finish_batch(), fresh.finish());
+                }
+            }
+        }
     }
 }
