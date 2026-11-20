@@ -356,6 +356,16 @@ impl ByteColumn {
         }
     }
 
+    /// [`push_wrapper`] for a string or bytes wrapper.
+    #[inline(always)]
+    fn push_wrapper(&mut self, value: Option<&[u8]>, flags: &mut FieldFlags) {
+        match value {
+            Some(v) => self.push_or_replace(v, flags),
+            None if !flags.contains(FieldFlags::HAS_VALUE) => self.push_or_replace(b"", flags),
+            None => {}
+        }
+    }
+
     #[cold]
     fn replace_cold(&mut self, value: &[u8]) {
         let start = self.offsets[self.offsets.len() - 2] as usize;
@@ -417,6 +427,11 @@ impl StringColumn {
     #[inline]
     fn push_or_replace(&mut self, value: &str, flags: &mut FieldFlags) {
         self.0.push_or_replace(value.as_bytes(), flags);
+    }
+
+    /// [`push_wrapper`] for a string wrapper.
+    fn push_wrapper(&mut self, value: Option<&str>, flags: &mut FieldFlags) {
+        self.0.push_wrapper(value.map(str::as_bytes), flags);
     }
 
     /// Builds a string array, large or not as configured.
@@ -1058,28 +1073,24 @@ enum FieldDecoder {
     },
 
     // --- Wrapper types (singular) ---
+    // Appended directly in `decode`, except `WrapperBool`, which buffers
+    // `value` until `flush`.
     WrapperDouble {
-        value: f64,
         builder: PrimitiveBuilder<Float64Type>,
     },
     WrapperFloat {
-        value: f32,
         builder: PrimitiveBuilder<Float32Type>,
     },
     WrapperInt64 {
-        value: i64,
         builder: PrimitiveBuilder<Int64Type>,
     },
     WrapperUInt64 {
-        value: u64,
         builder: PrimitiveBuilder<UInt64Type>,
     },
     WrapperInt32 {
-        value: i32,
         builder: PrimitiveBuilder<Int32Type>,
     },
     WrapperUInt32 {
-        value: u32,
         builder: PrimitiveBuilder<UInt32Type>,
     },
     WrapperBool {
@@ -1087,12 +1098,10 @@ enum FieldDecoder {
         builder: BooleanBuilder,
     },
     WrapperString {
-        value: Vec<u8>,
-        builder: StringBuilderInner,
+        builder: StringColumn,
     },
     WrapperBytes {
-        value: Vec<u8>,
-        builder: BinaryBuilderInner,
+        builder: ByteColumn,
     },
 
     // --- Nested message ---
@@ -1281,6 +1290,24 @@ fn push_or_replace_with<T: ArrowPrimitiveType, const N: usize>(
     Ok(N)
 }
 
+/// Appends one occurrence of a wrapper field: its value replaces the row's,
+/// as in [`push_or_replace`]; without one, the row gets the default unless it
+/// already has a value, as when protobuf merges the messages.
+#[inline(always)]
+fn push_wrapper<T: ArrowPrimitiveType>(
+    builder: &mut PrimitiveBuilder<T>,
+    value: Option<T::Native>,
+    flags: &mut FieldFlags,
+) {
+    match value {
+        Some(v) => push_or_replace(builder, v, flags),
+        None if !flags.contains(FieldFlags::HAS_VALUE) => {
+            push_or_replace(builder, T::Native::default(), flags)
+        }
+        None => {}
+    }
+}
+
 /// Ends a row for a directly appended primitive field that was absent from
 /// the message: null where the field has presence, the default otherwise.
 fn append_absent<T: ArrowPrimitiveType>(builder: &mut PrimitiveBuilder<T>, has_presence: bool) {
@@ -1367,10 +1394,10 @@ fn finish_time_of_day(builder: &mut PrimitiveBuilder<Int64Type>, unit: TimeUnit)
 
 impl FieldDecoder {
     /// Decodes one occurrence of this field and sets [`FieldFlags::HAS_VALUE`].
-    /// Singular numbers, enum numbers, strings and bytes are appended
-    /// directly; a repeat in the same row replaces the value. Bools (arrow's
-    /// `BooleanBuilder` can't replace a value), enum names, wrapper and
-    /// well-known types buffer their value until [`Self::flush`].
+    /// Singular numbers, enum numbers, strings, bytes and most wrappers are
+    /// appended directly; a repeat in the same row replaces the value. Bools
+    /// and `BoolValue` (arrow's `BooleanBuilder` can't replace a value), enum
+    /// names and well-known types buffer their value until [`Self::flush`].
     #[inline(always)]
     fn decode(
         &mut self,
@@ -1554,76 +1581,58 @@ impl FieldDecoder {
                 Ok(total)
             }
             // Wrapper types
-            Self::WrapperDouble { value, .. } => {
+            Self::WrapperDouble { builder } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
                 let (bytes, found) = decode_wrapper_fixed64(data)?;
-                if found {
-                    *value = f64::from_le_bytes(bytes);
-                }
-                flags.insert(FieldFlags::HAS_VALUE);
+                push_wrapper(builder, found.then(|| f64::from_le_bytes(bytes)), flags);
                 Ok(total)
             }
-            Self::WrapperFloat { value, .. } => {
+            Self::WrapperFloat { builder } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
                 let (bytes, found) = decode_wrapper_fixed32(data)?;
-                if found {
-                    *value = f32::from_le_bytes(bytes);
-                }
-                flags.insert(FieldFlags::HAS_VALUE);
+                push_wrapper(builder, found.then(|| f32::from_le_bytes(bytes)), flags);
                 Ok(total)
             }
-            Self::WrapperInt64 { value, .. } => {
+            Self::WrapperInt64 { builder } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
                 let (v, found) = decode_wrapper_varint(data)?;
-                if found {
-                    *value = v as i64;
-                }
-                flags.insert(FieldFlags::HAS_VALUE);
+                push_wrapper(builder, found.then_some(v as i64), flags);
                 Ok(total)
             }
-            Self::WrapperUInt64 { value, .. } => {
+            Self::WrapperUInt64 { builder } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
                 let (v, found) = decode_wrapper_varint(data)?;
-                if found {
-                    *value = v;
-                }
-                flags.insert(FieldFlags::HAS_VALUE);
+                push_wrapper(builder, found.then_some(v), flags);
                 Ok(total)
             }
-            Self::WrapperInt32 { value, .. } => {
+            Self::WrapperInt32 { builder } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
                 let (v, found) = decode_wrapper_varint(data)?;
-                if found {
-                    *value = v as i32;
-                }
-                flags.insert(FieldFlags::HAS_VALUE);
+                push_wrapper(builder, found.then_some(v as i32), flags);
                 Ok(total)
             }
-            Self::WrapperUInt32 { value, .. } => {
+            Self::WrapperUInt32 { builder } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
                 let (v, found) = decode_wrapper_varint(data)?;
-                if found {
-                    *value = v as u32;
-                }
-                flags.insert(FieldFlags::HAS_VALUE);
+                push_wrapper(builder, found.then_some(v as u32), flags);
                 Ok(total)
             }
             Self::WrapperBool { value, .. } => {
@@ -1638,28 +1647,20 @@ impl FieldDecoder {
                 flags.insert(FieldFlags::HAS_VALUE);
                 Ok(total)
             }
-            Self::WrapperString { value, .. } => {
+            Self::WrapperString { builder } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                if let Some(v) = decode_wrapper_string(data)? {
-                    value.clear();
-                    value.extend_from_slice(v.as_bytes());
-                }
-                flags.insert(FieldFlags::HAS_VALUE);
+                builder.push_wrapper(decode_wrapper_string(data)?, flags);
                 Ok(total)
             }
-            Self::WrapperBytes { value, .. } => {
+            Self::WrapperBytes { builder } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                if let Some(v) = decode_wrapper_bytes(data)? {
-                    value.clear();
-                    value.extend_from_slice(v);
-                }
-                flags.insert(FieldFlags::HAS_VALUE);
+                builder.push_wrapper(decode_wrapper_bytes(data)?, flags);
                 Ok(total)
             }
             // Nested message
@@ -1909,55 +1910,14 @@ impl FieldDecoder {
                 *seconds_val = 0;
                 *nanos = 0;
             }
-            // Wrapper types: present → value, absent → null
-            Self::WrapperDouble { value, builder } => {
-                if has_value {
-                    builder.append_value(*value);
-                } else {
-                    builder.append_null();
-                }
-                *value = 0.0;
-            }
-            Self::WrapperFloat { value, builder } => {
-                if has_value {
-                    builder.append_value(*value);
-                } else {
-                    builder.append_null();
-                }
-                *value = 0.0;
-            }
-            Self::WrapperInt64 { value, builder } => {
-                if has_value {
-                    builder.append_value(*value);
-                } else {
-                    builder.append_null();
-                }
-                *value = 0;
-            }
-            Self::WrapperUInt64 { value, builder } => {
-                if has_value {
-                    builder.append_value(*value);
-                } else {
-                    builder.append_null();
-                }
-                *value = 0;
-            }
-            Self::WrapperInt32 { value, builder } => {
-                if has_value {
-                    builder.append_value(*value);
-                } else {
-                    builder.append_null();
-                }
-                *value = 0;
-            }
-            Self::WrapperUInt32 { value, builder } => {
-                if has_value {
-                    builder.append_value(*value);
-                } else {
-                    builder.append_null();
-                }
-                *value = 0;
-            }
+            // Wrapper types: appended in decode, flushed only when absent,
+            // except `WrapperBool`.
+            Self::WrapperDouble { builder } => builder.append_null(),
+            Self::WrapperFloat { builder } => builder.append_null(),
+            Self::WrapperInt64 { builder } => builder.append_null(),
+            Self::WrapperUInt64 { builder } => builder.append_null(),
+            Self::WrapperInt32 { builder } => builder.append_null(),
+            Self::WrapperUInt32 { builder } => builder.append_null(),
             Self::WrapperBool { value, builder } => {
                 if has_value {
                     builder.append_value(*value);
@@ -1966,22 +1926,8 @@ impl FieldDecoder {
                 }
                 *value = false;
             }
-            Self::WrapperString { value, builder } => {
-                if has_value {
-                    builder.append_value(unsafe { std::str::from_utf8_unchecked(value) });
-                } else {
-                    builder.append_null();
-                }
-                value.clear();
-            }
-            Self::WrapperBytes { value, builder } => {
-                if has_value {
-                    builder.append_value(value.as_slice());
-                } else {
-                    builder.append_null();
-                }
-                value.clear();
-            }
+            Self::WrapperString { builder } => builder.push_null(),
+            Self::WrapperBytes { builder } => builder.push_null(),
             // Nested message
             Self::Message {
                 sub_decoder,
@@ -2533,35 +2479,37 @@ fn build_field_decoder(
                 enum_descriptor: enum_desc,
             }),
         },
-        Kind::Message(msg_desc) => buffered(build_message_field_decoder(msg_desc, config)?),
+        Kind::Message(msg_desc) => build_message_field_decoder(msg_desc, config),
     }
 }
 
 fn build_message_field_decoder(
     msg_desc: MessageDescriptor,
     config: &PtarsConfig,
-) -> Option<FieldDecoder> {
+) -> Option<(FieldDecoder, FieldFlags)> {
+    let direct = |decoder| Some((decoder, FieldFlags::empty()));
+    let buffered = |decoder| Some((decoder, FieldFlags::BUFFERED));
     match msg_desc.full_name() {
-        "google.protobuf.Timestamp" => Some(FieldDecoder::Timestamp {
+        "google.protobuf.Timestamp" => buffered(FieldDecoder::Timestamp {
             seconds: 0,
             nanos: 0,
             builder: PrimitiveBuilder::new(),
             unit: config.timestamp_unit.into(),
             tz: config.timestamp_tz.clone(),
         }),
-        "google.protobuf.Duration" => Some(FieldDecoder::Duration {
+        "google.protobuf.Duration" => buffered(FieldDecoder::Duration {
             seconds: 0,
             nanos: 0,
             builder: PrimitiveBuilder::new(),
             unit: config.duration_unit.into(),
         }),
-        "google.type.Date" => Some(FieldDecoder::Date {
+        "google.type.Date" => buffered(FieldDecoder::Date {
             year: 0,
             month: 0,
             day: 0,
             builder: PrimitiveBuilder::new(),
         }),
-        "google.type.TimeOfDay" => Some(FieldDecoder::TimeOfDay {
+        "google.type.TimeOfDay" => buffered(FieldDecoder::TimeOfDay {
             hours: 0,
             minutes: 0,
             seconds_val: 0,
@@ -2569,45 +2517,37 @@ fn build_message_field_decoder(
             builder: PrimitiveBuilder::new(),
             unit: config.time_unit.into(),
         }),
-        "google.protobuf.DoubleValue" => Some(FieldDecoder::WrapperDouble {
-            value: 0.0,
+        "google.protobuf.DoubleValue" => direct(FieldDecoder::WrapperDouble {
             builder: PrimitiveBuilder::new(),
         }),
-        "google.protobuf.FloatValue" => Some(FieldDecoder::WrapperFloat {
-            value: 0.0,
+        "google.protobuf.FloatValue" => direct(FieldDecoder::WrapperFloat {
             builder: PrimitiveBuilder::new(),
         }),
-        "google.protobuf.Int64Value" => Some(FieldDecoder::WrapperInt64 {
-            value: 0,
+        "google.protobuf.Int64Value" => direct(FieldDecoder::WrapperInt64 {
             builder: PrimitiveBuilder::new(),
         }),
-        "google.protobuf.UInt64Value" => Some(FieldDecoder::WrapperUInt64 {
-            value: 0,
+        "google.protobuf.UInt64Value" => direct(FieldDecoder::WrapperUInt64 {
             builder: PrimitiveBuilder::new(),
         }),
-        "google.protobuf.Int32Value" => Some(FieldDecoder::WrapperInt32 {
-            value: 0,
+        "google.protobuf.Int32Value" => direct(FieldDecoder::WrapperInt32 {
             builder: PrimitiveBuilder::new(),
         }),
-        "google.protobuf.UInt32Value" => Some(FieldDecoder::WrapperUInt32 {
-            value: 0,
+        "google.protobuf.UInt32Value" => direct(FieldDecoder::WrapperUInt32 {
             builder: PrimitiveBuilder::new(),
         }),
-        "google.protobuf.BoolValue" => Some(FieldDecoder::WrapperBool {
+        "google.protobuf.BoolValue" => buffered(FieldDecoder::WrapperBool {
             value: false,
             builder: BooleanBuilder::new(),
         }),
-        "google.protobuf.StringValue" => Some(FieldDecoder::WrapperString {
-            value: Vec::new(),
-            builder: StringBuilderInner::new(config.use_large_string),
+        "google.protobuf.StringValue" => direct(FieldDecoder::WrapperString {
+            builder: StringColumn::with_capacity(config.use_large_string, 0),
         }),
-        "google.protobuf.BytesValue" => Some(FieldDecoder::WrapperBytes {
-            value: Vec::new(),
-            builder: BinaryBuilderInner::new(config.use_large_binary),
+        "google.protobuf.BytesValue" => direct(FieldDecoder::WrapperBytes {
+            builder: ByteColumn::with_capacity(config.use_large_binary, 0),
         }),
         _ => {
             let sub_decoder = MessageDecoder::new(&msg_desc, config);
-            Some(FieldDecoder::Message {
+            buffered(FieldDecoder::Message {
                 sub_decoder: Box::new(sub_decoder),
                 is_valid: BooleanBuilder::new(),
             })
