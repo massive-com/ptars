@@ -2964,6 +2964,100 @@ mod tests {
         pool
     }
 
+    /// A wrapper that occurs again without its `value` keeps the earlier
+    /// value, as when protobuf merges the messages.
+    #[test]
+    fn test_wrappers_keep_value_when_repeated_empty() {
+        use arrow::array::{
+            ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array,
+            Int64Array, StringArray, UInt32Array, UInt64Array,
+        };
+        use std::sync::Arc;
+        let double = [&[0x09][..], &1.5f64.to_le_bytes()].concat();
+        let float = [&[0x0D][..], &1.5f32.to_le_bytes()].concat();
+        let cases: [(&str, Vec<u8>, ArrayRef); 9] = [
+            (
+                "DoubleValue",
+                double,
+                Arc::new(Float64Array::from(vec![1.5])),
+            ),
+            ("FloatValue", float, Arc::new(Float32Array::from(vec![1.5]))),
+            (
+                "Int64Value",
+                vec![0x08, 5],
+                Arc::new(Int64Array::from(vec![5])),
+            ),
+            (
+                "UInt64Value",
+                vec![0x08, 5],
+                Arc::new(UInt64Array::from(vec![5])),
+            ),
+            (
+                "Int32Value",
+                vec![0x08, 5],
+                Arc::new(Int32Array::from(vec![5])),
+            ),
+            (
+                "UInt32Value",
+                vec![0x08, 5],
+                Arc::new(UInt32Array::from(vec![5])),
+            ),
+            (
+                "BoolValue",
+                vec![0x08, 1],
+                Arc::new(BooleanArray::from(vec![true])),
+            ),
+            (
+                "StringValue",
+                b"\x0a\x03abc".to_vec(),
+                Arc::new(StringArray::from(vec!["abc"])),
+            ),
+            (
+                "BytesValue",
+                b"\x0a\x03abc".to_vec(),
+                Arc::new(BinaryArray::from(vec![&b"abc"[..]])),
+            ),
+        ];
+        let mut failed = Vec::new();
+        for (wrapper, inner, expected) in cases {
+            let mut pool = create_wrapper_pool(wrapper);
+            pool.add_file_descriptor_proto(FileDescriptorProto {
+                name: Some("test.proto".to_string()),
+                package: Some("test".to_string()),
+                syntax: Some("proto3".to_string()),
+                dependency: vec!["google/protobuf/wrappers.proto".to_string()],
+                message_type: vec![DescriptorProto {
+                    name: Some("M".to_string()),
+                    field: vec![FieldDescriptorProto {
+                        name: Some("w".to_string()),
+                        number: Some(1),
+                        label: Some(Label::Optional.into()),
+                        r#type: Some(Type::Message.into()),
+                        type_name: Some(format!(".google.protobuf.{wrapper}")),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+            let descriptor = pool.get_message_by_name("test.M").unwrap();
+            // Field 1 twice: `{value: ...}`, then `{}`.
+            let row = [&[0x0A, inner.len() as u8][..], &inner, &[0x0A, 0x00]].concat();
+            let array = arrow::array::BinaryArray::from_iter_values([row]);
+            let batch = crate::proto_to_arrow::binary_array_to_record_batch_direct(
+                &array,
+                &descriptor,
+                &PtarsConfig::default(),
+            )
+            .unwrap();
+            if batch.column(0).to_data() != expected.to_data() {
+                failed.push(wrapper);
+            }
+        }
+        assert!(failed.is_empty(), "{failed:?}");
+    }
+
     #[test]
     fn test_map_with_timestamp_value_roundtrip() {
         use std::collections::HashMap;

@@ -1663,8 +1663,10 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                let (v, _) = decode_wrapper_varint(data)?;
-                *value = v as i64;
+                let (v, found) = decode_wrapper_varint(data)?;
+                if found {
+                    *value = v as i64;
+                }
                 *has_value = true;
                 Ok(total)
             }
@@ -1675,8 +1677,10 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                let (v, _) = decode_wrapper_varint(data)?;
-                *value = v;
+                let (v, found) = decode_wrapper_varint(data)?;
+                if found {
+                    *value = v;
+                }
                 *has_value = true;
                 Ok(total)
             }
@@ -1687,8 +1691,10 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                let (v, _) = decode_wrapper_varint(data)?;
-                *value = v as i32;
+                let (v, found) = decode_wrapper_varint(data)?;
+                if found {
+                    *value = v as i32;
+                }
                 *has_value = true;
                 Ok(total)
             }
@@ -1699,8 +1705,10 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                let (v, _) = decode_wrapper_varint(data)?;
-                *value = v as u32;
+                let (v, found) = decode_wrapper_varint(data)?;
+                if found {
+                    *value = v as u32;
+                }
                 *has_value = true;
                 Ok(total)
             }
@@ -1711,8 +1719,10 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                let (v, _) = decode_wrapper_varint(data)?;
-                *value = v != 0;
+                let (v, found) = decode_wrapper_varint(data)?;
+                if found {
+                    *value = v != 0;
+                }
                 *has_value = true;
                 Ok(total)
             }
@@ -1723,9 +1733,11 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                let (v, _) = decode_wrapper_string(data)?;
-                value.clear();
-                value.extend_from_slice(&v);
+                let (v, found) = decode_wrapper_string(data)?;
+                if found {
+                    value.clear();
+                    value.extend_from_slice(&v);
+                }
                 *has_value = true;
                 Ok(total)
             }
@@ -1736,9 +1748,11 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                let (v, _) = decode_wrapper_bytes(data)?;
-                value.clear();
-                value.extend_from_slice(&v);
+                let (v, found) = decode_wrapper_bytes(data)?;
+                if found {
+                    value.clear();
+                    value.extend_from_slice(&v);
+                }
                 *has_value = true;
                 Ok(total)
             }
