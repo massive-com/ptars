@@ -2010,35 +2010,50 @@ impl FieldDecoder {
                 map_value_name,
                 map_value_nullable,
                 ..
-            } => {
-                let key_array = key_decoder.finish();
-                let value_array = value_decoder.finish();
-                let key_field = Arc::new(Field::new("key", key_array.data_type().clone(), false));
-                let value_field = Arc::new(Field::new(
-                    &**map_value_name,
-                    value_array.data_type().clone(),
-                    *map_value_nullable,
-                ));
-                let entries_struct_type = DataType::Struct(
-                    vec![key_field.as_ref().clone(), value_field.as_ref().clone()].into(),
-                );
-                let entry_struct =
-                    StructArray::from(vec![(key_field, key_array), (value_field, value_array)]);
-                let map_dt = DataType::Map(
-                    Arc::new(Field::new("entries", entries_struct_type, false)),
-                    false,
-                );
-                let len = offsets.len() - 1;
-                let offsets_buf = Buffer::from_vec(std::mem::take(offsets));
-                let map_data = ArrayData::builder(map_dt)
-                    .len(len)
-                    .add_buffer(offsets_buf)
-                    .add_child_data(entry_struct.into_data())
-                    .build()
-                    .unwrap();
-                Arc::new(MapArray::from(map_data))
-            }
+            } => Self::finish_map(
+                key_decoder,
+                value_decoder,
+                offsets,
+                map_value_name,
+                *map_value_nullable,
+            ),
         }
+    }
+
+    /// The map column for [`Self::finish`]. Its own function, like
+    /// [`Self::decode_map_entry`], since it finishes the key and the value.
+    fn finish_map(
+        key_decoder: &mut FieldDecoder,
+        value_decoder: &mut FieldDecoder,
+        offsets: &mut Vec<i32>,
+        map_value_name: &str,
+        map_value_nullable: bool,
+    ) -> Arc<dyn Array> {
+        let key_array = key_decoder.finish();
+        let value_array = value_decoder.finish();
+        let key_field = Arc::new(Field::new("key", key_array.data_type().clone(), false));
+        let value_field = Arc::new(Field::new(
+            map_value_name,
+            value_array.data_type().clone(),
+            map_value_nullable,
+        ));
+        let entries_struct_type =
+            DataType::Struct(vec![key_field.as_ref().clone(), value_field.as_ref().clone()].into());
+        let entry_struct =
+            StructArray::from(vec![(key_field, key_array), (value_field, value_array)]);
+        let map_dt = DataType::Map(
+            Arc::new(Field::new("entries", entries_struct_type, false)),
+            false,
+        );
+        let len = offsets.len() - 1;
+        let offsets_buf = Buffer::from_vec(std::mem::take(offsets));
+        let map_data = ArrayData::builder(map_dt)
+            .len(len)
+            .add_buffer(offsets_buf)
+            .add_child_data(entry_struct.into_data())
+            .build()
+            .unwrap();
+        Arc::new(MapArray::from(map_data))
     }
 }
 
