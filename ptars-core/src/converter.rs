@@ -2173,20 +2173,29 @@ mod tests {
     }
 
     /// In proto2, map entry fields support presence, but a missing key or
-    /// value still decodes to its default, not null.
+    /// value still decodes to its default, not null. A key repeated within
+    /// one row keeps every entry, in wire order: protobuf parsers keep only
+    /// the last, but Arrow maps allow repeated keys.
     #[test]
-    fn test_proto2_map_missing_key_or_value_is_default() {
+    fn test_proto2_map_missing_fields_and_repeated_keys() {
         use arrow::array::{Int32Array, MapArray, StringArray};
         let (_pool, descriptor) =
             create_map_descriptor_with_syntax(Type::Int32, Type::String, "proto2");
-        // Two entries in field 1: `{key: 5}` and `{value: "a"}`.
-        let row: &[u8] = &[0x0A, 0x02, 0x08, 0x05, 0x0A, 0x03, 0x12, 0x01, b'a'];
-        let batch = decode_raw(&descriptor, &[row], &PtarsConfig::default());
+        let rows: [&[u8]; 2] = [
+            // `{key: 5}` and `{value: "a"}`.
+            &[0x0A, 0x02, 0x08, 0x05, 0x0A, 0x03, 0x12, 0x01, b'a'],
+            // `{key: 5, value: "a"}` and `{key: 5, value: "b"}`.
+            &[
+                0x0A, 0x05, 0x08, 0x05, 0x12, 0x01, b'a', 0x0A, 0x05, 0x08, 0x05, 0x12, 0x01, b'b',
+            ],
+        ];
+        let batch = decode_raw(&descriptor, &rows, &PtarsConfig::default());
         let map = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
         let keys = map.keys().as_any().downcast_ref::<Int32Array>().unwrap();
         let values = map.values().as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(keys, &Int32Array::from(vec![5, 0]));
-        assert_eq!(values, &StringArray::from(vec!["", "a"]));
+        assert_eq!(map.value_offsets(), &[0, 2, 4]);
+        assert_eq!(keys, &Int32Array::from(vec![5, 0, 5, 5]));
+        assert_eq!(values, &StringArray::from(vec!["", "a", "a", "b"]));
     }
 
     /// An absent enum without presence (a proto2 map value) decodes as the

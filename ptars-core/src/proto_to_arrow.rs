@@ -1609,7 +1609,9 @@ impl FieldDecoder {
     }
 
     /// Decodes one entry of a map field. Out of line, since it decodes the
-    /// key and the value with [`Self::decode`].
+    /// key and the value with [`Self::decode`]. A key repeated in one row
+    /// keeps every entry: protobuf keeps only the last, but builders can't
+    /// drop an earlier entry.
     #[inline(never)]
     fn decode_map_entry(
         wire_type: u8,
