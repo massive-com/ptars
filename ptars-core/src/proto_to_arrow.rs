@@ -1120,7 +1120,7 @@ enum FieldDecoder {
 
     // --- Repeated fields (all collapsed into one variant) ---
     Repeated {
-        inner: RepeatedInner,
+        inner: Box<RepeatedInner>,
         offsets: ListOffsets,
         list_name: Arc<str>,
         list_nullable: bool,
@@ -2786,7 +2786,7 @@ fn build_repeated_decoder(field: &FieldDescriptor, config: &PtarsConfig) -> Opti
     };
 
     Some(FieldDecoder::Repeated {
-        inner,
+        inner: Box::new(inner),
         offsets: offsets(),
         list_name: ln,
         list_nullable: lnb,
@@ -2851,7 +2851,7 @@ fn build_repeated_message_decoder(
     };
 
     Some(FieldDecoder::Repeated {
-        inner,
+        inner: Box::new(inner),
         offsets,
         list_name: ln,
         list_nullable: lnb,
