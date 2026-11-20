@@ -2174,6 +2174,28 @@ mod tests {
         assert_eq!(values, &StringArray::from(vec!["", "a"]));
     }
 
+    /// A key repeated within one row keeps every entry, in wire order.
+    /// Protobuf parsers keep only the last; Arrow maps allow repeated keys.
+    #[test]
+    fn test_map_duplicate_key_keeps_every_entry() {
+        use arrow::array::{Int32Array, MapArray, StringArray};
+        let (_pool, descriptor) = create_map_descriptor(Type::Int32, Type::String);
+        // Two entries in field 1: `{key: 5, value: "a"}` and `{key: 5, value: "b"}`.
+        let row: &[u8] = &[
+            0x0A, 0x05, 0x08, 0x05, 0x12, 0x01, b'a', 0x0A, 0x05, 0x08, 0x05, 0x12, 0x01, b'b',
+        ];
+        let array = BinaryArray::from_iter_values([row]);
+        let batch =
+            binary_array_to_record_batch_direct(&array, &descriptor, &PtarsConfig::default())
+                .unwrap();
+        let map = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        let keys = map.keys().as_any().downcast_ref::<Int32Array>().unwrap();
+        let values = map.values().as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(map.value_length(0), 2);
+        assert_eq!(keys, &Int32Array::from(vec![5, 5]));
+        assert_eq!(values, &StringArray::from(vec!["a", "b"]));
+    }
+
     /// Every map key type must advance the map offsets, so each row keeps
     /// its own entries.
     #[test]
