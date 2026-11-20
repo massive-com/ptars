@@ -2100,15 +2100,32 @@ mod tests {
         create_map_descriptor_with_syntax(key_type, value_type, "proto3")
     }
 
+    /// `map<key_type, value_type> my_map = 1;`. An `Enum` value is
+    /// `enum E { B = 1; C = 2; }`, whose first value isn't 0.
     fn create_map_descriptor_with_syntax(
         key_type: Type,
         value_type: Type,
         syntax: &str,
     ) -> (DescriptorPool, MessageDescriptor) {
+        let enum_value =
+            |name: &str, number| prost_reflect::prost_types::EnumValueDescriptorProto {
+                name: Some(name.to_string()),
+                number: Some(number),
+                ..Default::default()
+            };
         let file_descriptor = FileDescriptorProto {
             name: Some("test.proto".to_string()),
             package: Some("test".to_string()),
             syntax: Some(syntax.to_string()),
+            enum_type: if value_type == Type::Enum {
+                vec![prost_reflect::prost_types::EnumDescriptorProto {
+                    name: Some("E".to_string()),
+                    value: vec![enum_value("B", 1), enum_value("C", 2)],
+                    ..Default::default()
+                }]
+            } else {
+                Vec::new()
+            },
             message_type: vec![
                 DescriptorProto {
                     name: Some("MapEntry".to_string()),
@@ -2125,6 +2142,7 @@ mod tests {
                             number: Some(2),
                             label: Some(Label::Optional.into()),
                             r#type: Some(value_type.into()),
+                            type_name: (value_type == Type::Enum).then(|| ".test.E".to_string()),
                             ..Default::default()
                         },
                     ],
@@ -2169,6 +2187,38 @@ mod tests {
         let values = map.values().as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(keys, &Int32Array::from(vec![5, 0]));
         assert_eq!(values, &StringArray::from(vec!["", "a"]));
+    }
+
+    /// An absent enum without presence (a proto2 map value) decodes as the
+    /// enum's first value, which in proto2 needn't be 0.
+    #[test]
+    fn test_proto2_map_missing_enum_value_is_first_value() {
+        use crate::config::EnumRepr;
+        use arrow::array::{Int32Array, MapArray, StringArray};
+        let (_pool, descriptor) =
+            create_map_descriptor_with_syntax(Type::String, Type::Enum, "proto2");
+        // One entry, `{key: "k"}`, without a value.
+        let row: &[u8] = &[0x0A, 0x03, 0x0A, 0x01, b'k'];
+        for repr in [EnumRepr::Int32, EnumRepr::String, EnumRepr::Binary] {
+            let config = PtarsConfig::default().with_enum_repr(repr);
+            let batch = decode_raw(&descriptor, &[row], &config);
+            let map = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+            let values = map.values().as_any();
+            match repr {
+                EnumRepr::Int32 => assert_eq!(
+                    values.downcast_ref::<Int32Array>().unwrap(),
+                    &Int32Array::from(vec![1])
+                ),
+                EnumRepr::String => assert_eq!(
+                    values.downcast_ref::<StringArray>().unwrap(),
+                    &StringArray::from(vec!["B"])
+                ),
+                EnumRepr::Binary => assert_eq!(
+                    values.downcast_ref::<BinaryArray>().unwrap(),
+                    &BinaryArray::from(vec![&b"B"[..]])
+                ),
+            }
+        }
     }
 
     #[test]

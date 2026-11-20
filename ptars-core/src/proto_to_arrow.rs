@@ -260,6 +260,8 @@ fn date_to_days_from_epoch(year: i32, month: i32, day: i32) -> i32 {
 /// protobuf permits — are formatted on the fly, as before.
 struct EnumNames {
     by_number: HashMap<i32, String>,
+    /// The enum's first value, for an absent field without presence.
+    default: i32,
 }
 
 impl EnumNames {
@@ -268,7 +270,15 @@ impl EnumNames {
             .values()
             .map(|v| (v.number(), v.name().to_string()))
             .collect();
-        Self { by_number }
+        Self {
+            by_number,
+            default: descriptor.default_value().number(),
+        }
+    }
+
+    /// The name of the enum's first value, which in proto2 needn't be 0.
+    fn default_name(&self) -> Cow<'_, str> {
+        self.name(self.default)
     }
 
     fn name(&self, number: i32) -> Cow<'_, str> {
@@ -959,6 +969,8 @@ enum FieldDecoder {
     },
     EnumInt32 {
         has_presence: bool,
+        /// The enum's first value, for an absent field without presence.
+        default: i32,
         builder: PrimitiveBuilder<Int32Type>,
     },
     EnumString {
@@ -1754,11 +1766,18 @@ impl FieldDecoder {
             | Self::Sfixed32 {
                 has_presence,
                 builder,
-            }
-            | Self::EnumInt32 {
-                has_presence,
-                builder,
             } => append_absent(builder, *has_presence),
+            Self::EnumInt32 {
+                has_presence,
+                default,
+                builder,
+            } => {
+                if *has_presence {
+                    builder.append_null();
+                } else {
+                    builder.append_value(*default);
+                }
+            }
             Self::Int64 {
                 has_presence,
                 builder,
@@ -1807,7 +1826,7 @@ impl FieldDecoder {
                 } else if *has_presence {
                     builder.append_null();
                 } else {
-                    builder.append_value(enum_names.name(0).as_ref());
+                    builder.append_value(enum_names.default_name().as_ref());
                 }
                 *has_value = false;
                 *value = 0;
@@ -1824,7 +1843,7 @@ impl FieldDecoder {
                 } else if *has_presence {
                     builder.append_null();
                 } else {
-                    builder.append_value(enum_names.name(0).as_bytes());
+                    builder.append_value(enum_names.default_name().as_bytes());
                 }
                 *has_value = false;
                 *value = 0;
@@ -2598,6 +2617,7 @@ fn build_field_decoder(
         Kind::Enum(enum_desc) => match config.enum_repr {
             EnumRepr::Int32 => Some(FieldDecoder::EnumInt32 {
                 has_presence,
+                default: enum_desc.default_value().number(),
                 builder: PrimitiveBuilder::with_capacity(capacity),
             }),
             EnumRepr::String => Some(FieldDecoder::EnumString {
@@ -2980,6 +3000,7 @@ fn build_singular_decoder_for_map(
         Kind::Enum(enum_desc) => match config.enum_repr {
             EnumRepr::Int32 => Some(FieldDecoder::EnumInt32 {
                 has_presence: false,
+                default: enum_desc.default_value().number(),
                 builder: PrimitiveBuilder::new(),
             }),
             EnumRepr::String => Some(FieldDecoder::EnumString {
