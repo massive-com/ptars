@@ -2867,6 +2867,65 @@ mod tests {
         pool
     }
 
+    /// A wrapper that occurs again without its `value` keeps the earlier
+    /// value, as when protobuf merges the messages.
+    #[test]
+    fn test_wrappers_keep_value_when_repeated_empty() {
+        let cases = [
+            ("DoubleValue", Value::F64(1.5)),
+            ("FloatValue", Value::F32(1.5)),
+            ("Int64Value", Value::I64(5)),
+            ("UInt64Value", Value::U64(5)),
+            ("Int32Value", Value::I32(5)),
+            ("UInt32Value", Value::U32(5)),
+            ("BoolValue", Value::Bool(true)),
+            ("StringValue", Value::String("abc".to_string())),
+            ("BytesValue", Value::Bytes(b"abc".to_vec().into())),
+        ];
+        for (wrapper, value) in cases {
+            let mut pool = create_wrapper_pool(wrapper);
+            pool.add_file_descriptor_proto(FileDescriptorProto {
+                name: Some("test.proto".to_string()),
+                package: Some("test".to_string()),
+                syntax: Some("proto3".to_string()),
+                dependency: vec!["google/protobuf/wrappers.proto".to_string()],
+                message_type: vec![DescriptorProto {
+                    name: Some("M".to_string()),
+                    field: vec![FieldDescriptorProto {
+                        name: Some("w".to_string()),
+                        number: Some(1),
+                        label: Some(Label::Optional.into()),
+                        r#type: Some(Type::Message.into()),
+                        type_name: Some(format!(".google.protobuf.{wrapper}")),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+            let descriptor = pool.get_message_by_name("test.M").unwrap();
+            let w = descriptor.get_field_by_name("w").unwrap();
+            let Kind::Message(wrapper_descriptor) = w.kind() else {
+                unreachable!()
+            };
+            let message = |inner: DynamicMessage| {
+                let mut message = DynamicMessage::new(descriptor.clone());
+                message.set_field(&w, Value::Message(inner));
+                message
+            };
+            let mut set = DynamicMessage::new(wrapper_descriptor.clone());
+            set.set_field_by_name("value", value);
+            // Field 1 twice: `{value: ...}`, then `{}`.
+            let row = vec![
+                message(set),
+                message(DynamicMessage::new(wrapper_descriptor)),
+            ];
+            assert_eq!(row[1].encode_to_vec(), [0x0A, 0x00], "{wrapper}");
+            assert_concatenation_merges(&descriptor, &[row], &[PtarsConfig::default()]);
+        }
+    }
+
     #[test]
     fn test_map_with_timestamp_value_roundtrip() {
         use std::collections::HashMap;
