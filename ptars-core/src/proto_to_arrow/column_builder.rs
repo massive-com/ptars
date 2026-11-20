@@ -68,6 +68,16 @@ impl ByteColumn {
         }
     }
 
+    /// [`super::push_wrapper`] for a string or bytes wrapper.
+    #[inline(always)]
+    pub(super) fn push_wrapper(&mut self, value: Option<&[u8]>, flags: &mut FieldFlags) {
+        match value {
+            Some(v) => self.push_or_replace(v, flags),
+            None if !flags.contains(FieldFlags::HAS_VALUE) => self.push_or_replace(b"", flags),
+            None => {}
+        }
+    }
+
     #[cold]
     fn replace_cold(&mut self, value: &[u8]) {
         let start = self.offsets[self.offsets.len() - 2] as usize;
@@ -129,6 +139,11 @@ impl StringColumn {
     #[inline]
     pub(super) fn push_or_replace(&mut self, value: &str, flags: &mut FieldFlags) {
         self.0.push_or_replace(value.as_bytes(), flags);
+    }
+
+    /// [`super::push_wrapper`] for a string wrapper.
+    pub(super) fn push_wrapper(&mut self, value: Option<&str>, flags: &mut FieldFlags) {
+        self.0.push_wrapper(value.map(str::as_bytes), flags);
     }
 
     /// Builds a string array, large or not as configured.
