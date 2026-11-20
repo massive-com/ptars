@@ -2097,10 +2097,18 @@ mod tests {
         key_type: Type,
         value_type: Type,
     ) -> (DescriptorPool, MessageDescriptor) {
+        create_map_descriptor_with_syntax(key_type, value_type, "proto3")
+    }
+
+    fn create_map_descriptor_with_syntax(
+        key_type: Type,
+        value_type: Type,
+        syntax: &str,
+    ) -> (DescriptorPool, MessageDescriptor) {
         let file_descriptor = FileDescriptorProto {
             name: Some("test.proto".to_string()),
             package: Some("test".to_string()),
-            syntax: Some("proto3".to_string()),
+            syntax: Some(syntax.to_string()),
             message_type: vec![
                 DescriptorProto {
                     name: Some("MapEntry".to_string()),
@@ -2144,6 +2152,23 @@ mod tests {
         let pool = create_pool_with_message(file_descriptor);
         let message_descriptor = pool.get_message_by_name("test.MessageWithMap").unwrap();
         (pool, message_descriptor)
+    }
+
+    /// In proto2, map entry fields support presence, but a missing key or
+    /// value still decodes to its default, not null.
+    #[test]
+    fn test_proto2_map_missing_key_or_value_is_default() {
+        use arrow::array::{Int32Array, MapArray, StringArray};
+        let (_pool, descriptor) =
+            create_map_descriptor_with_syntax(Type::Int32, Type::String, "proto2");
+        // Two entries in field 1: `{key: 5}` and `{value: "a"}`.
+        let row: &[u8] = &[0x0A, 0x02, 0x08, 0x05, 0x0A, 0x03, 0x12, 0x01, b'a'];
+        let batch = decode_raw(&descriptor, &[row], &PtarsConfig::default());
+        let map = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        let keys = map.keys().as_any().downcast_ref::<Int32Array>().unwrap();
+        let values = map.values().as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(keys, &Int32Array::from(vec![5, 0]));
+        assert_eq!(values, &StringArray::from(vec!["", "a"]));
     }
 
     #[test]
