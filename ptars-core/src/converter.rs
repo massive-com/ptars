@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::arrow_to_proto::record_batch_to_array;
-    use crate::config::PtarsConfig;
+    use crate::config::{EnumRepr, PtarsConfig};
     use crate::proto_to_arrow::{
         binary_array_to_record_batch_direct, messages_to_record_batch,
         messages_to_record_batch_with_config,
@@ -6010,10 +6010,24 @@ mod tests {
             proto3_optional: Some(true),
             ..scalar_field("opt", 18, Type::Int64)
         });
+        fields.push(FieldDescriptorProto {
+            type_name: Some(".test.Color".to_string()),
+            ..scalar_field("color", 19, Type::Enum)
+        });
+        let color = |name: &str, number| prost_reflect::prost_types::EnumValueDescriptorProto {
+            name: Some(name.to_string()),
+            number: Some(number),
+            ..Default::default()
+        };
         let file_descriptor = FileDescriptorProto {
             name: Some("merge.proto".to_string()),
             package: Some("test".to_string()),
             syntax: Some("proto3".to_string()),
+            enum_type: vec![prost_reflect::prost_types::EnumDescriptorProto {
+                name: Some("Color".to_string()),
+                value: vec![color("RED", 0), color("GREEN", 1), color("BLUE", 2)],
+                ..Default::default()
+            }],
             message_type: vec![
                 DescriptorProto {
                     name: Some("Inner".to_string()),
@@ -6068,7 +6082,7 @@ mod tests {
                 Kind::String => Value::String(format!("s{n}")),
                 Kind::Bytes => Value::Bytes(format!("b{n}").into_bytes().into()),
                 Kind::Message(inner) => Value::Message(merge_sample(&inner, seed + 1)),
-                Kind::Enum(_) => unreachable!(),
+                Kind::Enum(_) => Value::EnumNumber((n % 5) as i32),
             };
             message.set_field(&field, value);
         }
@@ -6132,6 +6146,12 @@ mod tests {
             use_large_binary: true,
             ..PtarsConfig::default()
         };
-        assert_concatenation_merges(&descriptor, &rows, &[PtarsConfig::default(), large]);
+        let enum_string = PtarsConfig::default().with_enum_repr(EnumRepr::String);
+        let enum_binary = PtarsConfig::default().with_enum_repr(EnumRepr::Binary);
+        assert_concatenation_merges(
+            &descriptor,
+            &rows,
+            &[PtarsConfig::default(), large, enum_string, enum_binary],
+        );
     }
 }
