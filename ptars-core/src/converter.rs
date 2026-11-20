@@ -2174,6 +2174,50 @@ mod tests {
         assert_eq!(values, &StringArray::from(vec!["", "a"]));
     }
 
+    /// Every map key type must advance the map offsets, so each row keeps
+    /// its own entries.
+    #[test]
+    fn test_map_every_key_type_keeps_its_entries() {
+        use arrow::array::MapArray;
+        use prost_reflect::MapKey;
+        type KeyOf = fn(i64) -> MapKey;
+        let keys: [(Type, KeyOf); 12] = [
+            (Type::Int32, |v| MapKey::I32(v as i32)),
+            (Type::Int64, MapKey::I64),
+            (Type::Uint32, |v| MapKey::U32(v as u32)),
+            (Type::Uint64, |v| MapKey::U64(v as u64)),
+            (Type::Sint32, |v| MapKey::I32(v as i32)),
+            (Type::Sint64, MapKey::I64),
+            (Type::Fixed32, |v| MapKey::U32(v as u32)),
+            (Type::Fixed64, |v| MapKey::U64(v as u64)),
+            (Type::Sfixed32, |v| MapKey::I32(v as i32)),
+            (Type::Sfixed64, MapKey::I64),
+            (Type::Bool, |v| MapKey::Bool(v % 2 == 1)),
+            (Type::String, |v| MapKey::String(v.to_string())),
+        ];
+        let mut failed = Vec::new();
+        for (key_type, key) in keys {
+            let (_pool, descriptor) = create_map_descriptor(key_type, Type::String);
+            let messages: Vec<_> = (0..3)
+                .map(|row| {
+                    let map = (0..2)
+                        .map(|i| (key(2 * row + i), Value::String(format!("v{row}{i}"))))
+                        .collect();
+                    let mut msg = DynamicMessage::new(descriptor.clone());
+                    msg.set_field_by_name("my_map", Value::Map(map));
+                    msg
+                })
+                .collect();
+            let batch = messages_to_record_batch(&messages, &descriptor);
+            let map = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+            let lengths: Vec<_> = (0..3).map(|row| map.value_length(row)).collect();
+            if lengths != vec![2, 2, 2] {
+                failed.push((key_type, lengths));
+            }
+        }
+        assert!(failed.is_empty(), "{failed:?}");
+    }
+
     #[test]
     fn test_map_int32_key_roundtrip() {
         use std::collections::HashMap;
