@@ -100,6 +100,7 @@ fn decode_tag(buf: &[u8]) -> Result<(u32, u8, usize), prost::DecodeError> {
     Ok((field_number, wire_type, n))
 }
 
+#[cold]
 fn skip_field(wire_type: u8, buf: &[u8]) -> Result<usize, prost::DecodeError> {
     match wire_type {
         0 => {
