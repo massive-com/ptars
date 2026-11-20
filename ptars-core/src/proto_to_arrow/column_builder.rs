@@ -30,10 +30,6 @@ pub(super) struct ByteColumn {
 }
 
 impl ByteColumn {
-    pub(super) fn new(large: bool) -> Self {
-        Self::with_capacity(large, 0)
-    }
-
     /// Room for `rows` rows; the value bytes still grow as needed.
     pub(super) fn with_capacity(large: bool, rows: usize) -> Self {
         let mut offsets = Vec::with_capacity(rows + 1);
@@ -113,10 +109,6 @@ fn narrow_offsets(offsets: Vec<i64>) -> OffsetBuffer<i32> {
 pub(super) struct StringColumn(ByteColumn);
 
 impl StringColumn {
-    pub(super) fn new(large: bool) -> Self {
-        Self(ByteColumn::new(large))
-    }
-
     pub(super) fn with_capacity(large: bool, rows: usize) -> Self {
         Self(ByteColumn::with_capacity(large, rows))
     }
