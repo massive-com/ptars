@@ -312,12 +312,6 @@ impl StringBuilderInner {
             Self::Large(b) => b.append_value(v),
         }
     }
-    fn append_null(&mut self) {
-        match self {
-            Self::Regular(b) => b.append_null(),
-            Self::Large(b) => b.append_null(),
-        }
-    }
     fn finish(&mut self) -> Arc<dyn Array> {
         match self {
             Self::Regular(b) => Arc::new(b.finish()),
@@ -349,12 +343,6 @@ impl BinaryBuilderInner {
         match self {
             Self::Regular(b) => b.append_value(v),
             Self::Large(b) => b.append_value(v),
-        }
-    }
-    fn append_null(&mut self) {
-        match self {
-            Self::Regular(b) => b.append_null(),
-            Self::Large(b) => b.append_null(),
         }
     }
     fn finish(&mut self) -> Arc<dyn Array> {
@@ -893,8 +881,8 @@ impl RepeatedInner {
 
 enum FieldDecoder {
     // --- Singular scalars ---
-    // Appended directly in `decode`, except `Bool`, `EnumString` and
-    // `EnumBinary`, which buffer `value` until `flush`.
+    // Appended directly in `decode`, except `Bool`, which buffers `value`
+    // until `flush`.
     Int32 {
         builder: PrimitiveBuilder<Int32Type>,
     },
@@ -947,13 +935,11 @@ enum FieldDecoder {
         builder: PrimitiveBuilder<Int32Type>,
     },
     EnumString {
-        value: i32,
-        builder: StringBuilderInner,
+        builder: StringColumn,
         enum_names: EnumNames,
     },
     EnumBinary {
-        value: i32,
-        builder: BinaryBuilderInner,
+        builder: ByteColumn,
         enum_names: EnumNames,
     },
 
@@ -1326,13 +1312,26 @@ impl FieldDecoder {
                 push_or_replace(builder, v as i32, flags);
                 Ok(n)
             }
-            Self::EnumString { value, .. } | Self::EnumBinary { value, .. } => {
+            Self::EnumString {
+                builder,
+                enum_names,
+            } => {
                 if wire_type != 0 {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                *value = v as i32;
-                flags.insert(FieldFlags::HAS_VALUE);
+                builder.push_or_replace(enum_names.name(v as i32).as_ref(), flags);
+                Ok(n)
+            }
+            Self::EnumBinary {
+                builder,
+                enum_names,
+            } => {
+                if wire_type != 0 {
+                    return skip_field(wire_type, buf);
+                }
+                let (v, n) = decode_varint(buf)?;
+                builder.push_or_replace(enum_names.name(v as i32).as_bytes(), flags);
                 Ok(n)
             }
             Self::Int64 { builder, .. } => {
@@ -1701,32 +1700,24 @@ impl FieldDecoder {
             Self::Float { builder } => append_absent(builder, has_presence),
             Self::Double { builder } => append_absent(builder, has_presence),
             Self::EnumString {
-                value,
                 builder,
                 enum_names,
             } => {
-                if has_value {
-                    builder.append_value(enum_names.name(*value).as_ref());
-                } else if has_presence {
-                    builder.append_null();
+                if has_presence {
+                    builder.push_null();
                 } else {
-                    builder.append_value(enum_names.default_name().as_ref());
+                    builder.push(enum_names.default_name().as_ref());
                 }
-                *value = 0;
             }
             Self::EnumBinary {
-                value,
                 builder,
                 enum_names,
             } => {
-                if has_value {
-                    builder.append_value(enum_names.name(*value).as_bytes());
-                } else if has_presence {
-                    builder.append_null();
+                if has_presence {
+                    builder.push_null();
                 } else {
-                    builder.append_value(enum_names.default_name().as_bytes());
+                    builder.push(enum_names.default_name().as_bytes());
                 }
-                *value = 0;
             }
             Self::Bool { value, builder } => {
                 if has_value {
@@ -2401,14 +2392,12 @@ fn build_field_decoder(
                 default: enum_desc.default_value().number(),
                 builder: PrimitiveBuilder::with_capacity(capacity),
             }),
-            EnumRepr::String => buffered(FieldDecoder::EnumString {
-                value: 0,
-                builder: StringBuilderInner::new(config.use_large_string),
+            EnumRepr::String => direct(FieldDecoder::EnumString {
+                builder: StringColumn::with_capacity(config.use_large_string, capacity),
                 enum_names: EnumNames::new(&enum_desc),
             }),
-            EnumRepr::Binary => buffered(FieldDecoder::EnumBinary {
-                value: 0,
-                builder: BinaryBuilderInner::new(config.use_large_binary),
+            EnumRepr::Binary => direct(FieldDecoder::EnumBinary {
+                builder: ByteColumn::with_capacity(config.use_large_binary, capacity),
                 enum_names: EnumNames::new(&enum_desc),
             }),
         },
