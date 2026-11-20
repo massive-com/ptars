@@ -216,10 +216,16 @@ fn convert_seconds_nanos_to_unit(seconds: i64, nanos: i32, unit: TimeUnit, type_
 
 static CE_OFFSET: i32 = 719163;
 
-fn enum_name(enum_descriptor: &EnumDescriptor, number: i32) -> String {
+/// Calls `f` with the name of value `number` of `enum_descriptor`, or with the
+/// number itself when the enum has no such value.
+fn with_enum_name<R>(
+    enum_descriptor: &EnumDescriptor,
+    number: i32,
+    f: impl FnOnce(&str) -> R,
+) -> R {
     match enum_descriptor.get_value(number) {
-        Some(v) => v.name().to_string(),
-        None => number.to_string(),
+        Some(v) => f(v.name()),
+        None => f(&number.to_string()),
     }
 }
 
@@ -718,13 +724,17 @@ impl RepeatedInner {
                     let mut p = 0;
                     while p < data.len() {
                         let (v, n) = decode_varint(&data[p..])?;
-                        values_builder.append_value(&enum_name(enum_descriptor, v as i32));
+                        with_enum_name(enum_descriptor, v as i32, |name| {
+                            values_builder.append_value(name)
+                        });
                         p += n;
                     }
                     Ok(total)
                 } else if wire_type == 0 {
                     let (v, n) = decode_varint(buf)?;
-                    values_builder.append_value(&enum_name(enum_descriptor, v as i32));
+                    with_enum_name(enum_descriptor, v as i32, |name| {
+                        values_builder.append_value(name)
+                    });
                     Ok(n)
                 } else {
                     skip_field(wire_type, buf)
@@ -740,14 +750,17 @@ impl RepeatedInner {
                     let mut p = 0;
                     while p < data.len() {
                         let (v, n) = decode_varint(&data[p..])?;
-                        values_builder
-                            .append_value(enum_name(enum_descriptor, v as i32).as_bytes());
+                        with_enum_name(enum_descriptor, v as i32, |name| {
+                            values_builder.append_value(name.as_bytes())
+                        });
                         p += n;
                     }
                     Ok(total)
                 } else if wire_type == 0 {
                     let (v, n) = decode_varint(buf)?;
-                    values_builder.append_value(enum_name(enum_descriptor, v as i32).as_bytes());
+                    with_enum_name(enum_descriptor, v as i32, |name| {
+                        values_builder.append_value(name.as_bytes())
+                    });
                     Ok(n)
                 } else {
                     skip_field(wire_type, buf)
@@ -1769,14 +1782,11 @@ impl FieldDecoder {
                 enum_descriptor,
             } => {
                 if has_value {
-                    builder.append_value(&enum_name(enum_descriptor, *value));
+                    with_enum_name(enum_descriptor, *value, |name| builder.append_value(name));
                 } else if has_presence {
                     builder.append_null();
                 } else {
-                    builder.append_value(&enum_name(
-                        enum_descriptor,
-                        enum_descriptor.default_value().number(),
-                    ));
+                    builder.append_value(enum_descriptor.default_value().name());
                 }
                 *value = 0;
             }
@@ -1786,14 +1796,13 @@ impl FieldDecoder {
                 enum_descriptor,
             } => {
                 if has_value {
-                    builder.append_value(enum_name(enum_descriptor, *value).as_bytes());
+                    with_enum_name(enum_descriptor, *value, |name| {
+                        builder.append_value(name.as_bytes())
+                    });
                 } else if has_presence {
                     builder.append_null();
                 } else {
-                    builder.append_value(
-                        enum_name(enum_descriptor, enum_descriptor.default_value().number())
-                            .as_bytes(),
-                    );
+                    builder.append_value(enum_descriptor.default_value().name().as_bytes());
                 }
                 *value = 0;
             }
