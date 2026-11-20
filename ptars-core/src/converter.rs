@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::arrow_to_proto::record_batch_to_array;
-    use crate::config::PtarsConfig;
+    use crate::config::{EnumRepr, PtarsConfig};
     use crate::proto_to_arrow::{
         binary_array_to_record_batch_direct, messages_to_record_batch,
         messages_to_record_batch_with_config,
@@ -2097,10 +2097,18 @@ mod tests {
         key_type: Type,
         value_type: Type,
     ) -> (DescriptorPool, MessageDescriptor) {
+        create_map_descriptor_with_syntax(key_type, value_type, "proto3")
+    }
+
+    fn create_map_descriptor_with_syntax(
+        key_type: Type,
+        value_type: Type,
+        syntax: &str,
+    ) -> (DescriptorPool, MessageDescriptor) {
         let file_descriptor = FileDescriptorProto {
             name: Some("test.proto".to_string()),
             package: Some("test".to_string()),
-            syntax: Some("proto3".to_string()),
+            syntax: Some(syntax.to_string()),
             message_type: vec![
                 DescriptorProto {
                     name: Some("MapEntry".to_string()),
@@ -2144,6 +2152,192 @@ mod tests {
         let pool = create_pool_with_message(file_descriptor);
         let message_descriptor = pool.get_message_by_name("test.MessageWithMap").unwrap();
         (pool, message_descriptor)
+    }
+
+    /// In proto2, map entry fields support presence, but a missing key or
+    /// value still decodes to its default, not null.
+    #[test]
+    fn test_proto2_map_missing_key_or_value_is_default() {
+        use arrow::array::{Int32Array, MapArray, StringArray};
+        let (_pool, descriptor) =
+            create_map_descriptor_with_syntax(Type::Int32, Type::String, "proto2");
+        // Two entries in field 1: `{key: 5}` and `{value: "a"}`.
+        let row: &[u8] = &[0x0A, 0x02, 0x08, 0x05, 0x0A, 0x03, 0x12, 0x01, b'a'];
+        let array = BinaryArray::from_iter_values([row]);
+        let batch =
+            binary_array_to_record_batch_direct(&array, &descriptor, &PtarsConfig::default())
+                .unwrap();
+        let map = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        let keys = map.keys().as_any().downcast_ref::<Int32Array>().unwrap();
+        let values = map.values().as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(keys, &Int32Array::from(vec![5, 0]));
+        assert_eq!(values, &StringArray::from(vec!["", "a"]));
+    }
+
+    /// A key repeated within one row keeps every entry, in wire order.
+    /// Protobuf parsers keep only the last; Arrow maps allow repeated keys.
+    #[test]
+    fn test_map_duplicate_key_keeps_every_entry() {
+        use arrow::array::{Int32Array, MapArray, StringArray};
+        let (_pool, descriptor) = create_map_descriptor(Type::Int32, Type::String);
+        // Two entries in field 1: `{key: 5, value: "a"}` and `{key: 5, value: "b"}`.
+        let row: &[u8] = &[
+            0x0A, 0x05, 0x08, 0x05, 0x12, 0x01, b'a', 0x0A, 0x05, 0x08, 0x05, 0x12, 0x01, b'b',
+        ];
+        let array = BinaryArray::from_iter_values([row]);
+        let batch =
+            binary_array_to_record_batch_direct(&array, &descriptor, &PtarsConfig::default())
+                .unwrap();
+        let map = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        let keys = map.keys().as_any().downcast_ref::<Int32Array>().unwrap();
+        let values = map.values().as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(map.value_length(0), 2);
+        assert_eq!(keys, &Int32Array::from(vec![5, 5]));
+        assert_eq!(values, &StringArray::from(vec!["a", "b"]));
+    }
+
+    /// Every map key type must advance the map offsets, so each row keeps
+    /// its own entries.
+    #[test]
+    fn test_map_every_key_type_keeps_its_entries() {
+        use arrow::array::MapArray;
+        use prost_reflect::MapKey;
+        type KeyOf = fn(i64) -> MapKey;
+        let keys: [(Type, KeyOf); 12] = [
+            (Type::Int32, |v| MapKey::I32(v as i32)),
+            (Type::Int64, MapKey::I64),
+            (Type::Uint32, |v| MapKey::U32(v as u32)),
+            (Type::Uint64, |v| MapKey::U64(v as u64)),
+            (Type::Sint32, |v| MapKey::I32(v as i32)),
+            (Type::Sint64, MapKey::I64),
+            (Type::Fixed32, |v| MapKey::U32(v as u32)),
+            (Type::Fixed64, |v| MapKey::U64(v as u64)),
+            (Type::Sfixed32, |v| MapKey::I32(v as i32)),
+            (Type::Sfixed64, MapKey::I64),
+            (Type::Bool, |v| MapKey::Bool(v % 2 == 1)),
+            (Type::String, |v| MapKey::String(v.to_string())),
+        ];
+        let mut failed = Vec::new();
+        for (key_type, key) in keys {
+            let (_pool, descriptor) = create_map_descriptor(key_type, Type::String);
+            let messages: Vec<_> = (0..3)
+                .map(|row| {
+                    let map = (0..2)
+                        .map(|i| (key(2 * row + i), Value::String(format!("v{row}{i}"))))
+                        .collect();
+                    let mut msg = DynamicMessage::new(descriptor.clone());
+                    msg.set_field_by_name("my_map", Value::Map(map));
+                    msg
+                })
+                .collect();
+            let batch = messages_to_record_batch(&messages, &descriptor);
+            let map = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+            let lengths: Vec<_> = (0..3).map(|row| map.value_length(row)).collect();
+            if lengths != vec![2, 2, 2] {
+                failed.push((key_type, lengths));
+            }
+        }
+        assert!(failed.is_empty(), "{failed:?}");
+    }
+
+    /// An absent enum without presence (a proto2 map value) decodes as the
+    /// enum's first value, which in proto2 needn't be 0.
+    #[test]
+    fn test_proto2_map_missing_enum_value_is_first_value() {
+        use crate::config::EnumRepr;
+        use arrow::array::{BinaryArray, Int32Array, MapArray, StringArray};
+        let file_descriptor = FileDescriptorProto {
+            name: Some("test.proto".to_string()),
+            package: Some("test".to_string()),
+            syntax: Some("proto2".to_string()),
+            enum_type: vec![prost_reflect::prost_types::EnumDescriptorProto {
+                name: Some("E".to_string()),
+                value: vec![
+                    prost_reflect::prost_types::EnumValueDescriptorProto {
+                        name: Some("B".to_string()),
+                        number: Some(1),
+                        ..Default::default()
+                    },
+                    prost_reflect::prost_types::EnumValueDescriptorProto {
+                        name: Some("C".to_string()),
+                        number: Some(2),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            message_type: vec![
+                DescriptorProto {
+                    name: Some("MapEntry".to_string()),
+                    field: vec![
+                        FieldDescriptorProto {
+                            name: Some("key".to_string()),
+                            number: Some(1),
+                            label: Some(Label::Optional.into()),
+                            r#type: Some(Type::String.into()),
+                            ..Default::default()
+                        },
+                        FieldDescriptorProto {
+                            name: Some("value".to_string()),
+                            number: Some(2),
+                            label: Some(Label::Optional.into()),
+                            r#type: Some(Type::Enum.into()),
+                            type_name: Some(".test.E".to_string()),
+                            ..Default::default()
+                        },
+                    ],
+                    options: Some(prost_reflect::prost_types::MessageOptions {
+                        map_entry: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                DescriptorProto {
+                    name: Some("WithMap".to_string()),
+                    field: vec![FieldDescriptorProto {
+                        name: Some("my_map".to_string()),
+                        number: Some(1),
+                        label: Some(Label::Repeated.into()),
+                        r#type: Some(Type::Message.into()),
+                        type_name: Some(".test.MapEntry".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let descriptor = create_pool_with_message(file_descriptor)
+            .get_message_by_name("test.WithMap")
+            .unwrap();
+        // One entry, `{key: "k"}`, without a value.
+        let row: &[u8] = &[0x0A, 0x03, 0x0A, 0x01, b'k'];
+        let array = arrow::array::BinaryArray::from_iter_values([row]);
+        for repr in [EnumRepr::Int32, EnumRepr::String, EnumRepr::Binary] {
+            let config = PtarsConfig::default().with_enum_repr(repr);
+            let batch = crate::proto_to_arrow::binary_array_to_record_batch_direct(
+                &array,
+                &descriptor,
+                &config,
+            )
+            .unwrap();
+            let map = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+            let values = map.values().as_any();
+            match repr {
+                EnumRepr::Int32 => assert_eq!(
+                    values.downcast_ref::<Int32Array>().unwrap(),
+                    &Int32Array::from(vec![1])
+                ),
+                EnumRepr::String => assert_eq!(
+                    values.downcast_ref::<StringArray>().unwrap(),
+                    &StringArray::from(vec!["B"])
+                ),
+                EnumRepr::Binary => assert_eq!(
+                    values.downcast_ref::<BinaryArray>().unwrap(),
+                    &BinaryArray::from(vec![&b"B"[..]])
+                ),
+            }
+        }
     }
 
     #[test]
@@ -2790,6 +2984,100 @@ mod tests {
         })
         .unwrap();
         pool
+    }
+
+    /// A wrapper that occurs again without its `value` keeps the earlier
+    /// value, as when protobuf merges the messages.
+    #[test]
+    fn test_wrappers_keep_value_when_repeated_empty() {
+        use arrow::array::{
+            ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array,
+            Int64Array, StringArray, UInt32Array, UInt64Array,
+        };
+        use std::sync::Arc;
+        let double = [&[0x09][..], &1.5f64.to_le_bytes()].concat();
+        let float = [&[0x0D][..], &1.5f32.to_le_bytes()].concat();
+        let cases: [(&str, Vec<u8>, ArrayRef); 9] = [
+            (
+                "DoubleValue",
+                double,
+                Arc::new(Float64Array::from(vec![1.5])),
+            ),
+            ("FloatValue", float, Arc::new(Float32Array::from(vec![1.5]))),
+            (
+                "Int64Value",
+                vec![0x08, 5],
+                Arc::new(Int64Array::from(vec![5])),
+            ),
+            (
+                "UInt64Value",
+                vec![0x08, 5],
+                Arc::new(UInt64Array::from(vec![5])),
+            ),
+            (
+                "Int32Value",
+                vec![0x08, 5],
+                Arc::new(Int32Array::from(vec![5])),
+            ),
+            (
+                "UInt32Value",
+                vec![0x08, 5],
+                Arc::new(UInt32Array::from(vec![5])),
+            ),
+            (
+                "BoolValue",
+                vec![0x08, 1],
+                Arc::new(BooleanArray::from(vec![true])),
+            ),
+            (
+                "StringValue",
+                b"\x0a\x03abc".to_vec(),
+                Arc::new(StringArray::from(vec!["abc"])),
+            ),
+            (
+                "BytesValue",
+                b"\x0a\x03abc".to_vec(),
+                Arc::new(BinaryArray::from(vec![&b"abc"[..]])),
+            ),
+        ];
+        let mut failed = Vec::new();
+        for (wrapper, inner, expected) in cases {
+            let mut pool = create_wrapper_pool(wrapper);
+            pool.add_file_descriptor_proto(FileDescriptorProto {
+                name: Some("test.proto".to_string()),
+                package: Some("test".to_string()),
+                syntax: Some("proto3".to_string()),
+                dependency: vec!["google/protobuf/wrappers.proto".to_string()],
+                message_type: vec![DescriptorProto {
+                    name: Some("M".to_string()),
+                    field: vec![FieldDescriptorProto {
+                        name: Some("w".to_string()),
+                        number: Some(1),
+                        label: Some(Label::Optional.into()),
+                        r#type: Some(Type::Message.into()),
+                        type_name: Some(format!(".google.protobuf.{wrapper}")),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+            let descriptor = pool.get_message_by_name("test.M").unwrap();
+            // Field 1 twice: `{value: ...}`, then `{}`.
+            let row = [&[0x0A, inner.len() as u8][..], &inner, &[0x0A, 0x00]].concat();
+            let array = arrow::array::BinaryArray::from_iter_values([row]);
+            let batch = crate::proto_to_arrow::binary_array_to_record_batch_direct(
+                &array,
+                &descriptor,
+                &PtarsConfig::default(),
+            )
+            .unwrap();
+            if batch.column(0).to_data() != expected.to_data() {
+                failed.push(wrapper);
+            }
+        }
+        assert!(failed.is_empty(), "{failed:?}");
     }
 
     #[test]
@@ -5519,10 +5807,24 @@ mod tests {
             proto3_optional: Some(true),
             ..scalar_field("opt", 18, Type::Int64)
         });
+        fields.push(FieldDescriptorProto {
+            type_name: Some(".test.Color".to_string()),
+            ..scalar_field("color", 19, Type::Enum)
+        });
+        let color = |name: &str, number| prost_reflect::prost_types::EnumValueDescriptorProto {
+            name: Some(name.to_string()),
+            number: Some(number),
+            ..Default::default()
+        };
         let file_descriptor = FileDescriptorProto {
             name: Some("merge.proto".to_string()),
             package: Some("test".to_string()),
             syntax: Some("proto3".to_string()),
+            enum_type: vec![prost_reflect::prost_types::EnumDescriptorProto {
+                name: Some("Color".to_string()),
+                value: vec![color("RED", 0), color("GREEN", 1), color("BLUE", 2)],
+                ..Default::default()
+            }],
             message_type: vec![
                 DescriptorProto {
                     name: Some("Inner".to_string()),
@@ -5569,7 +5871,7 @@ mod tests {
                 Kind::String => Value::String(format!("s{n}")),
                 Kind::Bytes => Value::Bytes(format!("b{n}").into_bytes().into()),
                 Kind::Message(inner) => Value::Message(merge_sample(&inner, seed + 1)),
-                Kind::Enum(_) => unreachable!(),
+                Kind::Enum(_) => Value::EnumNumber((n % 5) as i32),
             };
             message.set_field(&field, value);
         }
@@ -5624,7 +5926,13 @@ mod tests {
             use_large_binary: true,
             ..PtarsConfig::default()
         };
-        assert_concatenation_merges(&descriptor, &rows, &[PtarsConfig::default(), large]);
+        let enum_string = PtarsConfig::default().with_enum_repr(EnumRepr::String);
+        let enum_binary = PtarsConfig::default().with_enum_repr(EnumRepr::Binary);
+        assert_concatenation_merges(
+            &descriptor,
+            &rows,
+            &[PtarsConfig::default(), large, enum_string, enum_binary],
+        );
     }
 
     /// Many fields (130), mixing directly appended (int64, string, double)
