@@ -860,12 +860,7 @@ impl RepeatedInner {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                let (v, found) = decode_wrapper_string(data)?;
-                if found {
-                    values_builder.append_value(unsafe { std::str::from_utf8_unchecked(&v) });
-                } else {
-                    values_builder.append_value("");
-                }
+                values_builder.append_value(decode_wrapper_string(data)?.unwrap_or_default());
                 Ok(total)
             }
             Self::WrapperBytes { values_builder, .. } => {
@@ -873,12 +868,7 @@ impl RepeatedInner {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                let (v, found) = decode_wrapper_bytes(data)?;
-                if found {
-                    values_builder.append_value(&v);
-                } else {
-                    values_builder.append_value(b"");
-                }
+                values_builder.append_value(decode_wrapper_bytes(data)?.unwrap_or_default());
                 Ok(total)
             }
         }
@@ -1258,45 +1248,42 @@ fn decode_wrapper_fixed64(buf: &[u8]) -> Result<([u8; 8], bool), prost::DecodeEr
     Ok((val, found))
 }
 
-fn decode_wrapper_string(buf: &[u8]) -> Result<(Vec<u8>, bool), prost::DecodeError> {
-    let mut val = Vec::new();
-    let mut found = false;
+/// The last `value` field of a `StringValue` message, if any, borrowed from
+/// `buf` and checked to be UTF-8.
+fn decode_wrapper_string(buf: &[u8]) -> Result<Option<&str>, prost::DecodeError> {
+    let mut val = None;
     let mut pos = 0;
     while pos < buf.len() {
         let (fnum, wt, n) = decode_tag(&buf[pos..])?;
         pos += n;
         if fnum == 1 && wt == 2 {
             let (data, consumed) = read_length_delimited(&buf[pos..])?;
-            validate_utf8(data)?;
-            val.clear();
-            val.extend_from_slice(data);
-            found = true;
+            val = Some(validate_utf8(data)?);
             pos += consumed;
         } else {
             pos += skip_field(wt, &buf[pos..])?;
         }
     }
-    Ok((val, found))
+    Ok(val)
 }
 
-fn decode_wrapper_bytes(buf: &[u8]) -> Result<(Vec<u8>, bool), prost::DecodeError> {
-    let mut val = Vec::new();
-    let mut found = false;
+/// The last `value` field of a `BytesValue` message, if any, borrowed from
+/// `buf`.
+fn decode_wrapper_bytes(buf: &[u8]) -> Result<Option<&[u8]>, prost::DecodeError> {
+    let mut val = None;
     let mut pos = 0;
     while pos < buf.len() {
         let (fnum, wt, n) = decode_tag(&buf[pos..])?;
         pos += n;
         if fnum == 1 && wt == 2 {
             let (data, consumed) = read_length_delimited(&buf[pos..])?;
-            val.clear();
-            val.extend_from_slice(data);
-            found = true;
+            val = Some(data);
             pos += consumed;
         } else {
             pos += skip_field(wt, &buf[pos..])?;
         }
     }
-    Ok((val, found))
+    Ok(val)
 }
 
 // ---------------------------------------------------------------------------
@@ -1733,10 +1720,9 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                let (v, found) = decode_wrapper_string(data)?;
-                if found {
+                if let Some(v) = decode_wrapper_string(data)? {
                     value.clear();
-                    value.extend_from_slice(&v);
+                    value.extend_from_slice(v.as_bytes());
                 }
                 *has_value = true;
                 Ok(total)
@@ -1748,10 +1734,9 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                let (v, found) = decode_wrapper_bytes(data)?;
-                if found {
+                if let Some(v) = decode_wrapper_bytes(data)? {
                     value.clear();
-                    value.extend_from_slice(&v);
+                    value.extend_from_slice(v);
                 }
                 *has_value = true;
                 Ok(total)
