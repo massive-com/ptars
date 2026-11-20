@@ -2218,6 +2218,106 @@ mod tests {
         assert!(failed.is_empty(), "{failed:?}");
     }
 
+    /// An absent enum without presence (a proto2 map value) decodes as the
+    /// enum's first value, which in proto2 needn't be 0.
+    #[test]
+    fn test_proto2_map_missing_enum_value_is_first_value() {
+        use crate::config::EnumRepr;
+        use arrow::array::{BinaryArray, Int32Array, MapArray, StringArray};
+        let file_descriptor = FileDescriptorProto {
+            name: Some("test.proto".to_string()),
+            package: Some("test".to_string()),
+            syntax: Some("proto2".to_string()),
+            enum_type: vec![prost_reflect::prost_types::EnumDescriptorProto {
+                name: Some("E".to_string()),
+                value: vec![
+                    prost_reflect::prost_types::EnumValueDescriptorProto {
+                        name: Some("B".to_string()),
+                        number: Some(1),
+                        ..Default::default()
+                    },
+                    prost_reflect::prost_types::EnumValueDescriptorProto {
+                        name: Some("C".to_string()),
+                        number: Some(2),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            message_type: vec![
+                DescriptorProto {
+                    name: Some("MapEntry".to_string()),
+                    field: vec![
+                        FieldDescriptorProto {
+                            name: Some("key".to_string()),
+                            number: Some(1),
+                            label: Some(Label::Optional.into()),
+                            r#type: Some(Type::String.into()),
+                            ..Default::default()
+                        },
+                        FieldDescriptorProto {
+                            name: Some("value".to_string()),
+                            number: Some(2),
+                            label: Some(Label::Optional.into()),
+                            r#type: Some(Type::Enum.into()),
+                            type_name: Some(".test.E".to_string()),
+                            ..Default::default()
+                        },
+                    ],
+                    options: Some(prost_reflect::prost_types::MessageOptions {
+                        map_entry: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                DescriptorProto {
+                    name: Some("WithMap".to_string()),
+                    field: vec![FieldDescriptorProto {
+                        name: Some("my_map".to_string()),
+                        number: Some(1),
+                        label: Some(Label::Repeated.into()),
+                        r#type: Some(Type::Message.into()),
+                        type_name: Some(".test.MapEntry".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let descriptor = create_pool_with_message(file_descriptor)
+            .get_message_by_name("test.WithMap")
+            .unwrap();
+        // One entry, `{key: "k"}`, without a value.
+        let row: &[u8] = &[0x0A, 0x03, 0x0A, 0x01, b'k'];
+        let array = arrow::array::BinaryArray::from_iter_values([row]);
+        for repr in [EnumRepr::Int32, EnumRepr::String, EnumRepr::Binary] {
+            let config = PtarsConfig::default().with_enum_repr(repr);
+            let batch = crate::proto_to_arrow::binary_array_to_record_batch_direct(
+                &array,
+                &descriptor,
+                &config,
+            )
+            .unwrap();
+            let map = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+            let values = map.values().as_any();
+            match repr {
+                EnumRepr::Int32 => assert_eq!(
+                    values.downcast_ref::<Int32Array>().unwrap(),
+                    &Int32Array::from(vec![1])
+                ),
+                EnumRepr::String => assert_eq!(
+                    values.downcast_ref::<StringArray>().unwrap(),
+                    &StringArray::from(vec!["B"])
+                ),
+                EnumRepr::Binary => assert_eq!(
+                    values.downcast_ref::<BinaryArray>().unwrap(),
+                    &BinaryArray::from(vec![&b"B"[..]])
+                ),
+            }
+        }
+    }
+
     #[test]
     fn test_map_int32_key_roundtrip() {
         use std::collections::HashMap;
