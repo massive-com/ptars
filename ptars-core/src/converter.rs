@@ -6134,4 +6134,56 @@ mod tests {
             }
         }
     }
+
+    /// With `strict_wire_types`, a known field with a wire type its type
+    /// can't use fails the message, as in prost; without it, the field is
+    /// skipped. Packed and unpacked repeated fields are both fine.
+    #[test]
+    fn test_strict_wire_types() {
+        let file_descriptor = FileDescriptorProto {
+            name: Some("strict.proto".to_string()),
+            package: Some("test".to_string()),
+            syntax: Some("proto3".to_string()),
+            message_type: vec![DescriptorProto {
+                name: Some("Strict".to_string()),
+                field: vec![
+                    scalar_field("a", 1, Type::Int32),
+                    FieldDescriptorProto {
+                        label: Some(Label::Repeated.into()),
+                        ..scalar_field("r", 2, Type::Int32)
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let descriptor = create_pool_with_message(file_descriptor)
+            .get_message_by_name("test.Strict")
+            .unwrap();
+        let decode = |strict: bool, message: &[u8]| {
+            let config = PtarsConfig::default().with_strict_wire_types(strict);
+            let mut decoder = MessageDecoder::new(&descriptor, &config);
+            let ok = decoder.decode_row(message).is_ok();
+            (ok, decoder.finish())
+        };
+        // a = 7 as a varint, r = [1, 2] packed, then r = 3 unpacked.
+        let valid = [0x08, 7, 0x12, 2, 1, 2, 0x10, 3];
+        // a sent length-delimited: 0x0a = field 1, wire type 2.
+        let mismatched = [0x0a, 1, 7];
+
+        assert!(decode(true, &valid).0);
+        assert_eq!(decode(true, &valid).1, decode(false, &valid).1);
+        let (ok, lenient) = decode(false, &mismatched);
+        assert!(ok);
+        assert_eq!(
+            lenient
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .unwrap()
+                .value(0),
+            0
+        );
+        assert!(!decode(true, &mismatched).0);
+    }
 }
