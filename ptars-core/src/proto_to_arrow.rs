@@ -1042,7 +1042,7 @@ enum FieldDecoder {
 
     // --- Nested message ---
     Message {
-        sub_decoder: MessageDecoder,
+        sub_decoder: Box<MessageDecoder>,
         has_value: bool,
         is_valid: BooleanBuilder,
     },
@@ -2658,7 +2658,7 @@ fn build_message_field_decoder(
             }
             let sub_decoder = MessageDecoder::new_inner(&msg_desc, config, 0, ancestors);
             Some(FieldDecoder::Message {
-                sub_decoder,
+                sub_decoder: Box::new(sub_decoder),
                 has_value: false,
                 is_valid: BooleanBuilder::new(),
             })
