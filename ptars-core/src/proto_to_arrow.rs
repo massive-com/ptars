@@ -1,16 +1,20 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use arrow::array::ArrayData;
-use arrow::buffer::Buffer;
+use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
 use arrow_array::builder::ArrayBuilder;
 use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, LargeBinaryBuilder, LargeStringBuilder, PrimitiveBuilder,
-    StringBuilder,
+    BinaryBuilder, BooleanBuilder, LargeBinaryBuilder, LargeStringBuilder, NullBufferBuilder,
+    PrimitiveBuilder, StringBuilder,
 };
 use arrow_array::types::{
     Date32Type, Float32Type, Float64Type, Int32Type, Int64Type, UInt32Type, UInt64Type,
 };
-use arrow_array::{Array, ArrowPrimitiveType, BinaryArray, MapArray, RecordBatch, StructArray};
+use arrow_array::{
+    Array, ArrowPrimitiveType, BinaryArray, LargeBinaryArray, LargeStringArray, MapArray,
+    RecordBatch, StringArray, StructArray,
+};
 use arrow_schema::{DataType, Field, TimeUnit};
 use chrono::Datelike;
 
@@ -23,11 +27,52 @@ use crate::config::{ConfluentWirePolicy, EnumRepr, PtarsConfig};
 // ---------------------------------------------------------------------------
 
 #[allow(deprecated)]
-fn decode_error(msg: &str) -> prost::DecodeError {
-    prost::DecodeError::new(msg.to_string())
+fn decode_error(msg: impl Into<Cow<'static, str>>) -> prost::DecodeError {
+    prost::DecodeError::new(msg)
 }
 
+#[inline(always)]
 fn decode_varint(buf: &[u8]) -> Result<(u64, usize), prost::DecodeError> {
+    match buf.first() {
+        // one byte is very common; most field tags, and small values
+        Some(&byte) if byte < 0x80 => Ok((byte as u64, 1)),
+        _ => decode_varint_chunk(buf),
+    }
+}
+
+/// Packs the low 7 bits of each byte of `x` into the low 56 bits.
+#[inline(always)]
+fn pack_varint_groups(x: u64) -> u64 {
+    let x = x & 0x7f7f_7f7f_7f7f_7f7f;
+    let x = (x & 0x007f_007f_007f_007f) | ((x & 0x7f00_7f00_7f00_7f00) >> 1);
+    let x = (x & 0x0000_3fff_0000_3fff) | ((x & 0x3fff_0000_3fff_0000) >> 2);
+    (x & 0x0000_0000_0fff_ffff) | ((x & 0x0fff_ffff_0000_0000) >> 4)
+}
+
+/// Tries to decode the first 8 bytes without a branching, looping otherwise.
+#[cold]
+fn decode_varint_chunk(buf: &[u8]) -> Result<(u64, usize), prost::DecodeError> {
+    let Some((word, rest)) = buf.split_first_chunk() else {
+        return decode_varint_loop(buf);
+    };
+    let word = u64::from_le_bytes(*word);
+    let stops = !word & 0x8080_8080_8080_8080;
+    if stops != 0 {
+        let len = (stops.trailing_zeros() / 8 + 1) as usize;
+        let keep = u64::MAX >> (64 - 8 * len);
+        return Ok((pack_varint_groups(word & keep), len));
+    }
+    let low = pack_varint_groups(word);
+    match *rest {
+        [b8, ..] if b8 < 0x80 => Ok((low | (b8 as u64) << 56, 9)),
+        [b8, b9, ..] if b9 < 0x80 => Ok((low | ((b8 & 0x7f) as u64) << 56 | (b9 as u64) << 63, 10)),
+        [_, _, ..] => Err(decode_error("varint too large")),
+        _ => Err(decode_error("unexpected EOF in varint")),
+    }
+}
+
+/// Byte at a time, for varints with fewer than 8 bytes left in the buffer.
+fn decode_varint_loop(buf: &[u8]) -> Result<(u64, usize), prost::DecodeError> {
     let mut result: u64 = 0;
     let mut shift = 0u32;
     for (i, &byte) in buf.iter().enumerate() {
@@ -43,6 +88,17 @@ fn decode_varint(buf: &[u8]) -> Result<(u64, usize), prost::DecodeError> {
     Err(decode_error("unexpected EOF in varint"))
 }
 
+/// Validates `data` as UTF-8, checking for ASCII first: for short strings
+/// that is much cheaper than the out-of-line call to `str::from_utf8`.
+fn validate_utf8(data: &[u8]) -> Result<&str, prost::DecodeError> {
+    if data.is_ascii() {
+        // SAFETY: ASCII is valid UTF-8.
+        Ok(unsafe { std::str::from_utf8_unchecked(data) })
+    } else {
+        std::str::from_utf8(data).map_err(|_| decode_error("invalid UTF-8"))
+    }
+}
+
 fn decode_tag(buf: &[u8]) -> Result<(u32, u8, usize), prost::DecodeError> {
     let (key, n) = decode_varint(buf)?;
     let wire_type = (key & 0x07) as u8;
@@ -53,6 +109,7 @@ fn decode_tag(buf: &[u8]) -> Result<(u32, u8, usize), prost::DecodeError> {
     Ok((field_number, wire_type, n))
 }
 
+#[cold]
 fn skip_field(wire_type: u8, buf: &[u8]) -> Result<usize, prost::DecodeError> {
     match wire_type {
         0 => {
@@ -195,13 +252,10 @@ impl StringBuilderInner {
             Self::Large(b) => b.append_null(),
         }
     }
-    fn append_default(&mut self) {
-        self.append_value("");
-    }
     fn finish(&mut self) -> Arc<dyn Array> {
         match self {
-            Self::Regular(b) => Arc::new(std::mem::take(b).finish()),
-            Self::Large(b) => Arc::new(std::mem::take(b).finish()),
+            Self::Regular(b) => Arc::new(b.finish()),
+            Self::Large(b) => Arc::new(b.finish()),
         }
     }
     fn len(&self) -> usize {
@@ -237,19 +291,152 @@ impl BinaryBuilderInner {
             Self::Large(b) => b.append_null(),
         }
     }
-    fn append_default(&mut self) {
-        self.append_value(b"");
-    }
     fn finish(&mut self) -> Arc<dyn Array> {
         match self {
-            Self::Regular(b) => Arc::new(std::mem::take(b).finish()),
-            Self::Large(b) => Arc::new(std::mem::take(b).finish()),
+            Self::Regular(b) => Arc::new(b.finish()),
+            Self::Large(b) => Arc::new(b.finish()),
         }
     }
     fn len(&self) -> usize {
         match self {
             Self::Regular(b) => ArrayBuilder::len(b),
             Self::Large(b) => ArrayBuilder::len(b),
+        }
+    }
+}
+
+/// A binary column of a singular field, built one row at a time. Unlike
+/// arrow's builders, the value appended last can be replaced, for a field
+/// that occurs more than once in a message (last one wins). Strings use
+/// [`StringColumn`].
+struct ByteColumn {
+    /// Starts with 0; one end offset per row. `i64` until [`Self::finish`].
+    offsets: Vec<i64>,
+    values: Vec<u8>,
+    nulls: NullBufferBuilder,
+    large: bool,
+}
+
+impl ByteColumn {
+    fn new(large: bool) -> Self {
+        Self::with_capacity(large, 0)
+    }
+
+    /// Room for `rows` rows; the value bytes still grow as needed.
+    fn with_capacity(large: bool, rows: usize) -> Self {
+        let mut offsets = Vec::with_capacity(rows + 1);
+        offsets.push(0);
+        Self {
+            offsets,
+            values: Vec::new(),
+            nulls: NullBufferBuilder::new(rows),
+            large,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.offsets.len() - 1
+    }
+
+    #[inline(always)]
+    fn push(&mut self, value: &[u8]) {
+        self.values.extend_from_slice(value);
+        self.offsets.push(self.values.len() as i64);
+        self.nulls.append_non_null();
+    }
+
+    fn push_null(&mut self) {
+        self.offsets.push(self.values.len() as i64);
+        self.nulls.append_null();
+    }
+
+    #[inline]
+    fn push_or_replace(&mut self, value: &[u8], has_value: &mut bool) {
+        if *has_value {
+            self.replace_cold(value);
+        } else {
+            self.push(value);
+            *has_value = true;
+        }
+    }
+
+    #[cold]
+    fn replace_cold(&mut self, value: &[u8]) {
+        let start = self.offsets[self.offsets.len() - 2] as usize;
+        self.values.truncate(start);
+        self.values.extend_from_slice(value);
+        *self.offsets.last_mut().unwrap() = self.values.len() as i64;
+    }
+
+    /// Builds a binary array, large or not as configured.
+    fn finish(&mut self) -> Arc<dyn Array> {
+        let (offsets, values, nulls) = self.take_parts();
+        if self.large {
+            let offsets = OffsetBuffer::new(offsets.into());
+            Arc::new(LargeBinaryArray::new(offsets, values, nulls))
+        } else {
+            Arc::new(BinaryArray::new(narrow_offsets(offsets), values, nulls))
+        }
+    }
+
+    /// The offsets, values and nulls so far; the column is left empty.
+    fn take_parts(&mut self) -> (Vec<i64>, Buffer, Option<NullBuffer>) {
+        let offsets = std::mem::replace(&mut self.offsets, vec![0]);
+        let values = Buffer::from_vec(std::mem::take(&mut self.values));
+        (offsets, values, self.nulls.finish())
+    }
+}
+
+/// `i32` offsets for an array that isn't large.
+fn narrow_offsets(offsets: Vec<i64>) -> OffsetBuffer<i32> {
+    let offsets: Vec<i32> = offsets
+        .into_iter()
+        .map(|o| i32::try_from(o).expect("byte array offset overflow"))
+        .collect();
+    OffsetBuffer::new(offsets.into())
+}
+
+/// A [`ByteColumn`] of strings. It only takes `&str`, so every value is
+/// UTF-8 and [`Self::finish`] can build a string array without checking.
+struct StringColumn(ByteColumn);
+
+impl StringColumn {
+    fn new(large: bool) -> Self {
+        Self(ByteColumn::new(large))
+    }
+
+    fn with_capacity(large: bool, rows: usize) -> Self {
+        Self(ByteColumn::with_capacity(large, rows))
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    fn push(&mut self, value: &str) {
+        self.0.push(value.as_bytes());
+    }
+
+    fn push_null(&mut self) {
+        self.0.push_null();
+    }
+
+    #[inline]
+    fn push_or_replace(&mut self, value: &str, has_value: &mut bool) {
+        self.0.push_or_replace(value.as_bytes(), has_value);
+    }
+
+    /// Builds a string array, large or not as configured.
+    fn finish(&mut self) -> Arc<dyn Array> {
+        let (offsets, values, nulls) = self.0.take_parts();
+        // SAFETY: only `&str` values were pushed, so every value is UTF-8.
+        if self.0.large {
+            let offsets = OffsetBuffer::new(offsets.into());
+            Arc::new(unsafe { LargeStringArray::new_unchecked(offsets, values, nulls) })
+        } else {
+            let offsets = narrow_offsets(offsets);
+            Arc::new(unsafe { StringArray::new_unchecked(offsets, values, nulls) })
         }
     }
 }
@@ -502,7 +689,7 @@ impl RepeatedInner {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                let s = std::str::from_utf8(data).map_err(|_| decode_error("invalid UTF-8"))?;
+                let s = validate_utf8(data)?;
                 values_builder.append_value(s);
                 Ok(total)
             }
@@ -743,33 +930,25 @@ impl RepeatedInner {
             | Self::Sint32 { values_builder, .. }
             | Self::Sfixed32 { values_builder, .. }
             | Self::EnumInt32 { values_builder, .. }
-            | Self::WrapperInt32 { values_builder, .. } => {
-                Arc::new(std::mem::take(values_builder).finish())
-            }
+            | Self::WrapperInt32 { values_builder, .. } => Arc::new(values_builder.finish()),
             Self::Int64 { values_builder, .. }
             | Self::Sint64 { values_builder, .. }
             | Self::Sfixed64 { values_builder, .. }
-            | Self::WrapperInt64 { values_builder, .. } => {
-                Arc::new(std::mem::take(values_builder).finish())
-            }
+            | Self::WrapperInt64 { values_builder, .. } => Arc::new(values_builder.finish()),
             Self::UInt32 { values_builder, .. }
             | Self::Fixed32 { values_builder, .. }
-            | Self::WrapperUInt32 { values_builder, .. } => {
-                Arc::new(std::mem::take(values_builder).finish())
-            }
+            | Self::WrapperUInt32 { values_builder, .. } => Arc::new(values_builder.finish()),
             Self::UInt64 { values_builder, .. }
             | Self::Fixed64 { values_builder, .. }
-            | Self::WrapperUInt64 { values_builder, .. } => {
-                Arc::new(std::mem::take(values_builder).finish())
-            }
+            | Self::WrapperUInt64 { values_builder, .. } => Arc::new(values_builder.finish()),
             Self::Float { values_builder, .. } | Self::WrapperFloat { values_builder, .. } => {
-                Arc::new(std::mem::take(values_builder).finish())
+                Arc::new(values_builder.finish())
             }
             Self::Double { values_builder, .. } | Self::WrapperDouble { values_builder, .. } => {
-                Arc::new(std::mem::take(values_builder).finish())
+                Arc::new(values_builder.finish())
             }
             Self::Bool { values_builder, .. } | Self::WrapperBool { values_builder, .. } => {
-                Arc::new(std::mem::take(values_builder).finish())
+                Arc::new(values_builder.finish())
             }
             Self::String { values_builder, .. }
             | Self::EnumString { values_builder, .. }
@@ -787,7 +966,7 @@ impl RepeatedInner {
                 values_builder,
                 unit,
             } => finish_duration(values_builder, *unit),
-            Self::Date { values_builder, .. } => Arc::new(std::mem::take(values_builder).finish()),
+            Self::Date { values_builder, .. } => Arc::new(values_builder.finish()),
             Self::TimeOfDay {
                 values_builder,
                 unit,
@@ -882,16 +1061,12 @@ enum FieldDecoder {
         builder: BooleanBuilder,
     },
     String {
-        value: Vec<u8>,
-        has_value: bool,
         has_presence: bool,
-        builder: StringBuilderInner,
+        builder: StringColumn,
     },
     Bytes {
-        value: Vec<u8>,
-        has_value: bool,
         has_presence: bool,
-        builder: BinaryBuilderInner,
+        builder: ByteColumn,
     },
     EnumInt32 {
         value: i32,
@@ -1114,7 +1289,7 @@ fn decode_wrapper_string(buf: &[u8]) -> Result<(Vec<u8>, bool), prost::DecodeErr
         pos += n;
         if fnum == 1 && wt == 2 {
             let (data, consumed) = read_length_delimited(&buf[pos..])?;
-            std::str::from_utf8(data).map_err(|_| decode_error("invalid UTF-8"))?;
+            validate_utf8(data)?;
             val.clear();
             val.extend_from_slice(data);
             found = true;
@@ -1150,6 +1325,36 @@ fn decode_wrapper_bytes(buf: &[u8]) -> Result<(Vec<u8>, bool), prost::DecodeErro
 // Macro for flush/finish boilerplate
 // ---------------------------------------------------------------------------
 
+/// Appends `value`, or replaces the value appended earlier in this row when
+/// the field occurs again (`has_value`).
+#[inline(always)]
+fn push_or_replace<T: ArrowPrimitiveType>(
+    builder: &mut PrimitiveBuilder<T>,
+    value: T::Native,
+    has_value: &mut bool,
+) {
+    if *has_value {
+        *builder.values_slice_mut().last_mut().unwrap() = value;
+    } else {
+        builder.append_value(value);
+        *has_value = true;
+    }
+}
+
+#[inline(always)]
+fn push_or_replace_with<T: ArrowPrimitiveType, const N: usize>(
+    builder: &mut PrimitiveBuilder<T>,
+    buf: &[u8],
+    has_value: &mut bool,
+    f: impl FnOnce([u8; N]) -> T::Native,
+) -> Result<usize, prost::DecodeError> {
+    if buf.len() < N {
+        return Err(decode_error("unexpected EOF"));
+    }
+    push_or_replace(builder, (f)(buf[..N].try_into().unwrap()), has_value);
+    Ok(N)
+}
+
 macro_rules! flush_primitive {
     ($value:expr, $has_value:expr, $has_presence:expr, $builder:expr, $default:expr) => {
         if *$has_value {
@@ -1165,7 +1370,7 @@ macro_rules! flush_primitive {
 }
 
 fn finish_primitive<T: ArrowPrimitiveType>(builder: &mut PrimitiveBuilder<T>) -> Arc<dyn Array> {
-    Arc::new(std::mem::take(builder).finish())
+    Arc::new(builder.finish())
 }
 
 fn finish_timestamp(
@@ -1173,7 +1378,7 @@ fn finish_timestamp(
     unit: TimeUnit,
     tz: &Option<Arc<str>>,
 ) -> Arc<dyn Array> {
-    let values = std::mem::take(builder).finish();
+    let values = builder.finish();
     let dt = DataType::Timestamp(unit, tz.clone());
     let data = ArrayData::builder(dt)
         .len(values.len())
@@ -1185,7 +1390,7 @@ fn finish_timestamp(
 }
 
 fn finish_duration(builder: &mut PrimitiveBuilder<Int64Type>, unit: TimeUnit) -> Arc<dyn Array> {
-    let values = std::mem::take(builder).finish();
+    let values = builder.finish();
     let dt = DataType::Duration(unit);
     let data = ArrayData::builder(dt)
         .len(values.len())
@@ -1197,7 +1402,7 @@ fn finish_duration(builder: &mut PrimitiveBuilder<Int64Type>, unit: TimeUnit) ->
 }
 
 fn finish_time_of_day(builder: &mut PrimitiveBuilder<Int64Type>, unit: TimeUnit) -> Arc<dyn Array> {
-    let values = std::mem::take(builder).finish();
+    let values = builder.finish();
     let dt = match unit {
         TimeUnit::Second => DataType::Time32(TimeUnit::Second),
         TimeUnit::Millisecond => DataType::Time32(TimeUnit::Millisecond),
@@ -1239,20 +1444,25 @@ fn finish_time_of_day(builder: &mut PrimitiveBuilder<Int64Type>, unit: TimeUnit)
 // ---------------------------------------------------------------------------
 
 impl FieldDecoder {
-    fn decode(&mut self, wire_type: u8, buf: &[u8]) -> Result<usize, prost::DecodeError> {
+    /// Decodes one occurrence of this field. Singular numbers, enum numbers,
+    /// strings and bytes are appended directly and set `has_value`; a repeat in
+    /// the same row replaces the value. Bools (arrow's `BooleanBuilder` can't
+    /// replace a value), enum names, wrapper and well-known types buffer their
+    /// value until [`Self::flush`] and leave `has_value` alone.
+    #[inline(always)]
+    fn decode(
+        &mut self,
+        wire_type: u8,
+        buf: &[u8],
+        has_value: &mut bool,
+    ) -> Result<usize, prost::DecodeError> {
         match self {
-            Self::Int32 {
-                value, has_value, ..
-            }
-            | Self::EnumInt32 {
-                value, has_value, ..
-            } => {
+            Self::Int32 { builder, .. } | Self::EnumInt32 { builder, .. } => {
                 if wire_type != 0 {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                *value = v as i32;
-                *has_value = true;
+                push_or_replace(builder, v as i32, has_value);
                 Ok(n)
             }
             Self::EnumString {
@@ -1269,138 +1479,81 @@ impl FieldDecoder {
                 *has_value = true;
                 Ok(n)
             }
-            Self::Int64 {
-                value, has_value, ..
-            } => {
+            Self::Int64 { builder, .. } => {
                 if wire_type != 0 {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                *value = v as i64;
-                *has_value = true;
+                push_or_replace(builder, v as i64, has_value);
                 Ok(n)
             }
-            Self::UInt32 {
-                value, has_value, ..
-            } => {
+            Self::UInt32 { builder, .. } => {
                 if wire_type != 0 {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                *value = v as u32;
-                *has_value = true;
+                push_or_replace(builder, v as u32, has_value);
                 Ok(n)
             }
-            Self::UInt64 {
-                value, has_value, ..
-            } => {
+            Self::UInt64 { builder, .. } => {
                 if wire_type != 0 {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                *value = v;
-                *has_value = true;
+                push_or_replace(builder, v, has_value);
                 Ok(n)
             }
-            Self::Sint32 {
-                value, has_value, ..
-            } => {
+            Self::Sint32 { builder, .. } => {
                 if wire_type != 0 {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                *value = decode_zigzag32(v);
-                *has_value = true;
+                push_or_replace(builder, decode_zigzag32(v), has_value);
                 Ok(n)
             }
-            Self::Sint64 {
-                value, has_value, ..
-            } => {
+            Self::Sint64 { builder, .. } => {
                 if wire_type != 0 {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                *value = decode_zigzag64(v);
-                *has_value = true;
+                push_or_replace(builder, decode_zigzag64(v), has_value);
                 Ok(n)
             }
-            Self::Sfixed32 {
-                value, has_value, ..
-            } => {
+            Self::Sfixed32 { builder, .. } => {
                 if wire_type != 5 {
                     return skip_field(wire_type, buf);
                 }
-                if buf.len() < 4 {
-                    return Err(decode_error("unexpected EOF"));
-                }
-                *value = i32::from_le_bytes(buf[..4].try_into().unwrap());
-                *has_value = true;
-                Ok(4)
+                push_or_replace_with(builder, buf, has_value, i32::from_le_bytes)
             }
-            Self::Sfixed64 {
-                value, has_value, ..
-            } => {
+            Self::Sfixed64 { builder, .. } => {
                 if wire_type != 1 {
                     return skip_field(wire_type, buf);
                 }
-                if buf.len() < 8 {
-                    return Err(decode_error("unexpected EOF"));
-                }
-                *value = i64::from_le_bytes(buf[..8].try_into().unwrap());
-                *has_value = true;
-                Ok(8)
+                push_or_replace_with(builder, buf, has_value, i64::from_le_bytes)
             }
-            Self::Fixed32 {
-                value, has_value, ..
-            } => {
+            Self::Fixed32 { builder, .. } => {
                 if wire_type != 5 {
                     return skip_field(wire_type, buf);
                 }
-                if buf.len() < 4 {
-                    return Err(decode_error("unexpected EOF"));
-                }
-                *value = u32::from_le_bytes(buf[..4].try_into().unwrap());
-                *has_value = true;
-                Ok(4)
+                push_or_replace_with(builder, buf, has_value, u32::from_le_bytes)
             }
-            Self::Fixed64 {
-                value, has_value, ..
-            } => {
+            Self::Fixed64 { builder, .. } => {
                 if wire_type != 1 {
                     return skip_field(wire_type, buf);
                 }
-                if buf.len() < 8 {
-                    return Err(decode_error("unexpected EOF"));
-                }
-                *value = u64::from_le_bytes(buf[..8].try_into().unwrap());
-                *has_value = true;
-                Ok(8)
+                push_or_replace_with(builder, buf, has_value, u64::from_le_bytes)
             }
-            Self::Float {
-                value, has_value, ..
-            } => {
+            Self::Float { builder, .. } => {
                 if wire_type != 5 {
                     return skip_field(wire_type, buf);
                 }
-                if buf.len() < 4 {
-                    return Err(decode_error("unexpected EOF"));
-                }
-                *value = f32::from_le_bytes(buf[..4].try_into().unwrap());
-                *has_value = true;
-                Ok(4)
+                push_or_replace_with(builder, buf, has_value, f32::from_le_bytes)
             }
-            Self::Double {
-                value, has_value, ..
-            } => {
+            Self::Double { builder, .. } => {
                 if wire_type != 1 {
                     return skip_field(wire_type, buf);
                 }
-                if buf.len() < 8 {
-                    return Err(decode_error("unexpected EOF"));
-                }
-                *value = f64::from_le_bytes(buf[..8].try_into().unwrap());
-                *has_value = true;
-                Ok(8)
+                push_or_replace_with(builder, buf, has_value, f64::from_le_bytes)
             }
             Self::Bool {
                 value, has_value, ..
@@ -1413,29 +1566,20 @@ impl FieldDecoder {
                 *has_value = true;
                 Ok(n)
             }
-            Self::String {
-                value, has_value, ..
-            } => {
+            Self::String { builder, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                std::str::from_utf8(data).map_err(|_| decode_error("invalid UTF-8"))?;
-                value.clear();
-                value.extend_from_slice(data);
-                *has_value = true;
+                builder.push_or_replace(validate_utf8(data)?, has_value);
                 Ok(total)
             }
-            Self::Bytes {
-                value, has_value, ..
-            } => {
+            Self::Bytes { builder, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                value.clear();
-                value.extend_from_slice(data);
-                *has_value = true;
+                builder.push_or_replace(data, has_value);
                 Ok(total)
             }
             // Well-known types: decode submessage
@@ -1650,30 +1794,44 @@ impl FieldDecoder {
                 key_decoder,
                 value_decoder,
                 ..
-            } => {
-                if wire_type != 2 {
-                    return skip_field(wire_type, buf);
-                }
-                let (data, total) = read_length_delimited(buf)?;
-                // Parse entry submessage: field 1 = key, field 2 = value
-                let mut pos = 0;
-                while pos < data.len() {
-                    let (fnum, wt, n) = decode_tag(&data[pos..])?;
-                    pos += n;
-                    if fnum == 1 {
-                        pos += key_decoder.decode(wt, &data[pos..])?;
-                    } else if fnum == 2 {
-                        pos += value_decoder.decode(wt, &data[pos..])?;
-                    } else {
-                        pos += skip_field(wt, &data[pos..])?;
-                    }
-                }
-                // Flush key and value (they're buffered singular decoders)
-                key_decoder.flush();
-                value_decoder.flush();
-                Ok(total)
+            } => Self::decode_map_entry(wire_type, buf, key_decoder, value_decoder),
+        }
+    }
+
+    /// Decodes one entry of a map field. Out of line, since it decodes the
+    /// key and the value with [`Self::decode`].
+    #[inline(never)]
+    fn decode_map_entry(
+        wire_type: u8,
+        buf: &[u8],
+        key_decoder: &mut FieldDecoder,
+        value_decoder: &mut FieldDecoder,
+    ) -> Result<usize, prost::DecodeError> {
+        if wire_type != 2 {
+            return skip_field(wire_type, buf);
+        }
+        let (data, total) = read_length_delimited(buf)?;
+        // Parse entry submessage: field 1 = key, field 2 = value
+        let mut pos = 0;
+        let (mut key_seen, mut value_seen) = (false, false);
+        while pos < data.len() {
+            let (fnum, wt, n) = decode_tag(&data[pos..])?;
+            pos += n;
+            if fnum == 1 {
+                pos += key_decoder.decode(wt, &data[pos..], &mut key_seen)?;
+            } else if fnum == 2 {
+                pos += value_decoder.decode(wt, &data[pos..], &mut value_seen)?;
+            } else {
+                pos += skip_field(wt, &data[pos..])?;
             }
         }
+        if !key_seen {
+            key_decoder.flush();
+        }
+        if !value_seen {
+            value_decoder.flush();
+        }
+        Ok(total)
     }
 
     fn flush(&mut self) {
@@ -1818,37 +1976,26 @@ impl FieldDecoder {
                 *has_value = false;
                 *value = false;
             }
+            // Appended in decode; flushed only when absent from the row.
             Self::String {
-                value,
-                has_value,
                 has_presence,
                 builder,
             } => {
-                if *has_value {
-                    builder.append_value(unsafe { std::str::from_utf8_unchecked(value) });
-                } else if *has_presence {
-                    builder.append_null();
+                if *has_presence {
+                    builder.push_null();
                 } else {
-                    builder.append_default();
+                    builder.push("");
                 }
-                *has_value = false;
-                value.clear();
             }
             Self::Bytes {
-                value,
-                has_value,
                 has_presence,
                 builder,
             } => {
-                if *has_value {
-                    builder.append_value(value.as_slice());
-                } else if *has_presence {
-                    builder.append_null();
+                if *has_presence {
+                    builder.push_null();
                 } else {
-                    builder.append_default();
+                    builder.push(b"");
                 }
-                *has_value = false;
-                value.clear();
             }
             // Well-known types
             Self::Timestamp {
@@ -2105,10 +2252,10 @@ impl FieldDecoder {
         }
     }
 
-    fn finish(&mut self, nullable: bool) -> (Field, Arc<dyn Array>) {
-        // This is called by MessageDecoder::finish, which provides the field name separately
-        // We return a dummy field name here; the caller replaces it.
-        let array: Arc<dyn Array> = match self {
+    /// The column decoded so far; the builders are left empty. The caller
+    /// names the field.
+    fn finish(&mut self) -> Arc<dyn Array> {
+        match self {
             Self::Int32 { builder, .. } | Self::EnumInt32 { builder, .. } => {
                 finish_primitive(builder)
             }
@@ -2125,9 +2272,11 @@ impl FieldDecoder {
             Self::Fixed64 { builder, .. } => finish_primitive(builder),
             Self::Float { builder, .. } => finish_primitive(builder),
             Self::Double { builder, .. } => finish_primitive(builder),
-            Self::Bool { builder, .. } => Arc::new(std::mem::take(builder).finish()),
-            Self::String { builder, .. } | Self::EnumString { builder, .. } => builder.finish(),
-            Self::Bytes { builder, .. } | Self::EnumBinary { builder, .. } => builder.finish(),
+            Self::Bool { builder, .. } => Arc::new(builder.finish()),
+            Self::String { builder, .. } => builder.finish(),
+            Self::EnumString { builder, .. } => builder.finish(),
+            Self::Bytes { builder, .. } => builder.finish(),
+            Self::EnumBinary { builder, .. } => builder.finish(),
             Self::Timestamp {
                 builder, unit, tz, ..
             } => finish_timestamp(builder, *unit, tz),
@@ -2140,14 +2289,14 @@ impl FieldDecoder {
             Self::WrapperUInt64 { builder, .. } => finish_primitive(builder),
             Self::WrapperInt32 { builder, .. } => finish_primitive(builder),
             Self::WrapperUInt32 { builder, .. } => finish_primitive(builder),
-            Self::WrapperBool { builder, .. } => Arc::new(std::mem::take(builder).finish()),
+            Self::WrapperBool { builder, .. } => Arc::new(builder.finish()),
             Self::WrapperString { builder, .. } => builder.finish(),
             Self::WrapperBytes { builder, .. } => builder.finish(),
             Self::Message {
                 sub_decoder,
                 is_valid,
                 ..
-            } => Arc::new(sub_decoder.build_struct_array(Some(std::mem::take(is_valid).finish()))),
+            } => Arc::new(sub_decoder.build_struct_array(Some(is_valid.finish()))),
             Self::Repeated {
                 inner,
                 offsets,
@@ -2168,8 +2317,8 @@ impl FieldDecoder {
                 map_value_name,
                 map_value_nullable,
             } => {
-                let (_, key_array) = key_decoder.finish(false);
-                let (_, value_array) = value_decoder.finish(*map_value_nullable);
+                let key_array = key_decoder.finish();
+                let value_array = value_decoder.finish();
                 let key_field = Arc::new(Field::new("key", key_array.data_type().clone(), false));
                 let value_field = Arc::new(Field::new(
                     &**map_value_name,
@@ -2195,9 +2344,7 @@ impl FieldDecoder {
                     .unwrap();
                 Arc::new(MapArray::from(map_data))
             }
-        };
-        let field = Field::new("", array.data_type().clone(), nullable);
-        (field, array)
+        }
     }
 }
 
@@ -2309,8 +2456,18 @@ fn decode_repeated_wrapper_fixed64<T: ArrowPrimitiveType>(
 // MessageDecoder
 // ---------------------------------------------------------------------------
 
+/// One field of a [`MessageDecoder`].
+struct DecoderState {
+    decoder: FieldDecoder,
+    field: FieldDescriptor,
+    /// The decoder appended its value directly in the current row (see
+    /// [`FieldDecoder::decode`]).
+    has_value: bool,
+}
+
 pub struct MessageDecoder {
-    decoders: Vec<(FieldDecoder, FieldDescriptor)>,
+    /// One per field, in field order.
+    decoders: Vec<DecoderState>,
     tag_map: Vec<Option<usize>>,
     list_nullable: bool,
     map_nullable: bool,
@@ -2319,15 +2476,29 @@ pub struct MessageDecoder {
 
 impl MessageDecoder {
     pub fn new(descriptor: &MessageDescriptor, config: &PtarsConfig) -> Self {
+        Self::with_capacity(descriptor, config, 0)
+    }
+
+    /// Like [`MessageDecoder::new`], with the builders of singular scalar
+    /// fields sized for `capacity` rows.
+    pub fn with_capacity(
+        descriptor: &MessageDescriptor,
+        config: &PtarsConfig,
+        capacity: usize,
+    ) -> Self {
         let mut decoders = Vec::new();
         let mut max_field_number: u32 = 0;
 
         for field in descriptor.fields() {
-            if let Some(decoder) = build_field_decoder(&field, config) {
+            if let Some(decoder) = build_field_decoder(&field, config, capacity) {
                 if field.number() > max_field_number {
                     max_field_number = field.number();
                 }
-                decoders.push((decoder, field));
+                decoders.push(DecoderState {
+                    decoder,
+                    field,
+                    has_value: false,
+                });
             }
         }
 
@@ -2339,7 +2510,7 @@ impl MessageDecoder {
                 max_field_number as usize + 1
             }
         ];
-        for (idx, (_, field)) in decoders.iter().enumerate() {
+        for (idx, DecoderState { field, .. }) in decoders.iter().enumerate() {
             let num = field.number() as usize;
             tag_map[num] = Some(idx);
         }
@@ -2364,14 +2535,15 @@ impl MessageDecoder {
                 None
             };
             if let Some(idx) = idx {
-                pos += self.decoders[idx].0.decode(wire_type, &buf[pos..])?;
+                let DecoderState {
+                    decoder, has_value, ..
+                } = &mut self.decoders[idx];
+                pos += decoder.decode(wire_type, &buf[pos..], has_value)?;
             } else {
                 pos += skip_field(wire_type, &buf[pos..])?;
             }
         }
-        for (decoder, _) in &mut self.decoders {
-            decoder.flush();
-        }
+        self.flush_unseen();
         self.num_rows += 1;
         Ok(())
     }
@@ -2389,7 +2561,10 @@ impl MessageDecoder {
                 None
             };
             if let Some(idx) = idx {
-                pos += self.decoders[idx].0.decode(wire_type, &buf[pos..])?;
+                let DecoderState {
+                    decoder, has_value, ..
+                } = &mut self.decoders[idx];
+                pos += decoder.decode(wire_type, &buf[pos..], has_value)?;
             } else {
                 pos += skip_field(wire_type, &buf[pos..])?;
             }
@@ -2397,22 +2572,30 @@ impl MessageDecoder {
         Ok(())
     }
 
-    fn flush_row(&mut self) {
-        for (decoder, _) in &mut self.decoders {
-            decoder.flush();
+    /// Ends a row: flushes every decoder that did not append its value
+    /// directly (see [`FieldDecoder::decode`]) and clears `has_value`.
+    fn flush_unseen(&mut self) {
+        for DecoderState {
+            decoder, has_value, ..
+        } in &mut self.decoders
+        {
+            if !*has_value {
+                decoder.flush();
+            }
+            *has_value = false;
         }
+    }
+
+    fn flush_row(&mut self) {
+        self.flush_unseen();
     }
 
     fn flush_defaults(&mut self) {
-        for (decoder, _) in &mut self.decoders {
-            decoder.flush(); // all absent → defaults
-        }
+        self.flush_unseen(); // all absent → defaults
     }
 
     fn decode_null_row(&mut self) {
-        for (decoder, _) in &mut self.decoders {
-            decoder.flush();
-        }
+        self.flush_unseen();
         self.num_rows += 1;
     }
 
@@ -2432,18 +2615,24 @@ impl MessageDecoder {
         let (fields, columns): (Vec<_>, Vec<_>) = self
             .decoders
             .iter_mut()
-            .map(|(decoder, field_desc)| {
-                let nullable = if field_desc.is_list() {
-                    self.list_nullable
-                } else if field_desc.is_map() {
-                    self.map_nullable
-                } else {
-                    field_desc.supports_presence()
-                };
-                let (_, array) = decoder.finish(nullable);
-                let field = Field::new(field_desc.name(), array.data_type().clone(), nullable);
-                (field, array)
-            })
+            .map(
+                |DecoderState {
+                     decoder,
+                     field: field_desc,
+                     ..
+                 }| {
+                    let nullable = if field_desc.is_list() {
+                        self.list_nullable
+                    } else if field_desc.is_map() {
+                        self.map_nullable
+                    } else {
+                        field_desc.supports_presence()
+                    };
+                    let array = decoder.finish();
+                    let field = Field::new(field_desc.name(), array.data_type().clone(), nullable);
+                    (field, array)
+                },
+            )
             .unzip();
 
         StructArray::new(
@@ -2472,7 +2661,12 @@ impl MessageDecoder {
 // build_field_decoder
 // ---------------------------------------------------------------------------
 
-fn build_field_decoder(field: &FieldDescriptor, config: &PtarsConfig) -> Option<FieldDecoder> {
+/// `capacity`: rows to size scalar builders for (0 when unknown).
+fn build_field_decoder(
+    field: &FieldDescriptor,
+    config: &PtarsConfig,
+    capacity: usize,
+) -> Option<FieldDecoder> {
     if field.is_map() {
         return build_map_decoder(field, config);
     }
@@ -2486,98 +2680,94 @@ fn build_field_decoder(field: &FieldDescriptor, config: &PtarsConfig) -> Option<
             value: 0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Int64 => Some(FieldDecoder::Int64 {
             value: 0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Uint32 => Some(FieldDecoder::UInt32 {
             value: 0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Uint64 => Some(FieldDecoder::UInt64 {
             value: 0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Sint32 => Some(FieldDecoder::Sint32 {
             value: 0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Sint64 => Some(FieldDecoder::Sint64 {
             value: 0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Sfixed32 => Some(FieldDecoder::Sfixed32 {
             value: 0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Sfixed64 => Some(FieldDecoder::Sfixed64 {
             value: 0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Fixed32 => Some(FieldDecoder::Fixed32 {
             value: 0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Fixed64 => Some(FieldDecoder::Fixed64 {
             value: 0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Float => Some(FieldDecoder::Float {
             value: 0.0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Double => Some(FieldDecoder::Double {
             value: 0.0,
             has_value: false,
             has_presence,
-            builder: PrimitiveBuilder::new(),
+            builder: PrimitiveBuilder::with_capacity(capacity),
         }),
         Kind::Bool => Some(FieldDecoder::Bool {
             value: false,
             has_value: false,
             has_presence,
-            builder: BooleanBuilder::new(),
+            builder: BooleanBuilder::with_capacity(capacity),
         }),
         Kind::String => Some(FieldDecoder::String {
-            value: Vec::new(),
-            has_value: false,
             has_presence,
-            builder: StringBuilderInner::new(config.use_large_string),
+            builder: StringColumn::with_capacity(config.use_large_string, capacity),
         }),
         Kind::Bytes => Some(FieldDecoder::Bytes {
-            value: Vec::new(),
-            has_value: false,
             has_presence,
-            builder: BinaryBuilderInner::new(config.use_large_binary),
+            builder: ByteColumn::with_capacity(config.use_large_binary, capacity),
         }),
         Kind::Enum(enum_desc) => match config.enum_repr {
             EnumRepr::Int32 => Some(FieldDecoder::EnumInt32 {
                 value: 0,
                 has_value: false,
                 has_presence,
-                builder: PrimitiveBuilder::new(),
+                builder: PrimitiveBuilder::with_capacity(capacity),
             }),
             EnumRepr::String => Some(FieldDecoder::EnumString {
                 value: 0,
@@ -2939,16 +3129,12 @@ fn build_singular_decoder_for_map(
             builder: BooleanBuilder::new(),
         }),
         Kind::String => Some(FieldDecoder::String {
-            value: Vec::new(),
-            has_value: false,
             has_presence: false,
-            builder: StringBuilderInner::new(config.use_large_string),
+            builder: StringColumn::new(config.use_large_string),
         }),
         Kind::Bytes => Some(FieldDecoder::Bytes {
-            value: Vec::new(),
-            has_value: false,
             has_presence: false,
-            builder: BinaryBuilderInner::new(config.use_large_binary),
+            builder: ByteColumn::new(config.use_large_binary),
         }),
         Kind::Enum(enum_desc) => match config.enum_repr {
             EnumRepr::Int32 => Some(FieldDecoder::EnumInt32 {
@@ -2989,7 +3175,7 @@ pub fn binary_array_to_record_batch_direct(
     descriptor: &MessageDescriptor,
     config: &PtarsConfig,
 ) -> Result<RecordBatch, prost::DecodeError> {
-    let mut decoder = MessageDecoder::new(descriptor, config);
+    let mut decoder = MessageDecoder::with_capacity(descriptor, config, array.len());
     let policy = config.confluent_wire_policy;
     for i in 0..array.len() {
         if array.is_null(i) {
@@ -3109,5 +3295,56 @@ mod tests {
         let buf = b"\x00\x01";
         let result = strip_confluent_prefix(buf, ConfluentWirePolicy::Protobuf);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_utf8_matches_std() {
+        let cases: [&[u8]; 9] = [
+            b"",
+            b"EUR/USD",
+            "caf\u{e9}".as_bytes(),
+            "\u{65e5}\u{672c} long enough to span words".as_bytes(),
+            &[0xff],
+            &[b'a', 0xc3],
+            &[0xc0, 0x80],
+            &[0xed, 0xa0, 0x80],
+            b"ascii prefix then \xe2\x82",
+        ];
+        for case in cases {
+            assert_eq!(
+                validate_utf8(case).ok(),
+                std::str::from_utf8(case).ok(),
+                "{case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_varint_matches_loop() {
+        let mut values: Vec<u64> = vec![0, 1, 127, 128, u64::MAX, 1 << 63];
+        for bits in 0..64 {
+            values.extend([(1u64 << bits) - 1, 1u64 << bits, (1u64 << bits) + 1]);
+        }
+        values.push(1_731_700_000_000_000_000);
+        for v in values {
+            let mut enc = Vec::new();
+            prost::encoding::encode_varint(v, &mut enc);
+            // Exact length, a few trailing bytes (fewer than 8 in all take the
+            // byte loop) or many, and every truncation.
+            let mut short = enc.clone();
+            short.extend_from_slice(&[0xff; 2]);
+            let mut padded = enc.clone();
+            padded.extend_from_slice(&[0xff; 12]);
+            for buf in [&enc[..], &short[..], &padded[..]] {
+                assert_eq!(decode_varint(buf).unwrap(), (v, enc.len()), "{v}");
+                assert_eq!(decode_varint_loop(buf).unwrap(), (v, enc.len()), "{v}");
+            }
+            for cut in 0..enc.len() {
+                assert!(decode_varint(&enc[..cut]).is_err(), "{v} cut {cut}");
+            }
+        }
+        // Overlong: more than 10 bytes with the continuation bit set.
+        assert!(decode_varint(&[0xff; 11]).is_err());
+        assert!(decode_varint_loop(&[0xff; 11]).is_err());
     }
 }
