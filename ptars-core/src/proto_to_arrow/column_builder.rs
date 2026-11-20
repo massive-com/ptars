@@ -4,7 +4,7 @@ use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
 use arrow_array::builder::NullBufferBuilder;
 use arrow_array::{Array, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
 
-use super::decode_error;
+use super::{decode_error, FieldFlags};
 
 /// Validates `data` as UTF-8, checking for ASCII first: for short strings
 /// that is much cheaper than the out-of-line call to `str::from_utf8`.
@@ -59,12 +59,12 @@ impl ByteColumn {
     }
 
     #[inline]
-    pub(super) fn push_or_replace(&mut self, value: &[u8], has_value: &mut bool) {
-        if *has_value {
+    pub(super) fn push_or_replace(&mut self, value: &[u8], flags: &mut FieldFlags) {
+        if flags.contains(FieldFlags::HAS_VALUE) {
             self.replace_cold(value);
         } else {
             self.push(value);
-            *has_value = true;
+            flags.insert(FieldFlags::HAS_VALUE);
         }
     }
 
@@ -127,8 +127,8 @@ impl StringColumn {
     }
 
     #[inline]
-    pub(super) fn push_or_replace(&mut self, value: &str, has_value: &mut bool) {
-        self.0.push_or_replace(value.as_bytes(), has_value);
+    pub(super) fn push_or_replace(&mut self, value: &str, flags: &mut FieldFlags) {
+        self.0.push_or_replace(value.as_bytes(), flags);
     }
 
     /// Builds a string array, large or not as configured.

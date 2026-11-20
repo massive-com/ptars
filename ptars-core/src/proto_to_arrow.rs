@@ -1194,18 +1194,18 @@ fn decode_wrapper_bytes(buf: &[u8]) -> Result<Option<&[u8]>, prost::DecodeError>
 // ---------------------------------------------------------------------------
 
 /// Appends `value`, or replaces the value appended earlier in this row when
-/// the field occurs again (`has_value`).
+/// the field occurs again ([`FieldFlags::HAS_VALUE`]).
 #[inline(always)]
 fn push_or_replace<T: ArrowPrimitiveType>(
     builder: &mut PrimitiveBuilder<T>,
     value: T::Native,
-    has_value: &mut bool,
+    flags: &mut FieldFlags,
 ) {
-    if *has_value {
+    if flags.contains(FieldFlags::HAS_VALUE) {
         *builder.values_slice_mut().last_mut().unwrap() = value;
     } else {
         builder.append_value(value);
-        *has_value = true;
+        flags.insert(FieldFlags::HAS_VALUE);
     }
 }
 
@@ -1213,13 +1213,13 @@ fn push_or_replace<T: ArrowPrimitiveType>(
 fn push_or_replace_with<T: ArrowPrimitiveType, const N: usize>(
     builder: &mut PrimitiveBuilder<T>,
     buf: &[u8],
-    has_value: &mut bool,
+    flags: &mut FieldFlags,
     f: impl FnOnce([u8; N]) -> T::Native,
 ) -> Result<usize, prost::DecodeError> {
     if buf.len() < N {
         return Err(decode_error("unexpected EOF"));
     }
-    push_or_replace(builder, (f)(buf[..N].try_into().unwrap()), has_value);
+    push_or_replace(builder, (f)(buf[..N].try_into().unwrap()), flags);
     Ok(N)
 }
 
@@ -1309,16 +1309,17 @@ fn finish_time_of_day(builder: &mut PrimitiveBuilder<Int64Type>, unit: TimeUnit)
 
 impl FieldDecoder {
     /// Decodes one occurrence of this field. Singular numbers, enum numbers,
-    /// strings and bytes are appended directly and set `has_value`; a repeat in
-    /// the same row replaces the value. Bools (arrow's `BooleanBuilder` can't
-    /// replace a value), enum names, wrapper and well-known types buffer their
-    /// value until [`Self::flush`] and leave `has_value` alone.
+    /// strings and bytes are appended directly and set
+    /// [`FieldFlags::HAS_VALUE`]; a repeat in the same row replaces the value.
+    /// Bools (arrow's `BooleanBuilder` can't replace a value), enum names,
+    /// wrapper and well-known types buffer their value until [`Self::flush`]
+    /// and leave it unset.
     #[inline(always)]
     fn decode(
         &mut self,
         wire_type: u8,
         buf: &[u8],
-        has_value: &mut bool,
+        flags: &mut FieldFlags,
     ) -> Result<usize, prost::DecodeError> {
         match self {
             Self::Int32 { builder, .. } | Self::EnumInt32 { builder, .. } => {
@@ -1326,7 +1327,7 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                push_or_replace(builder, v as i32, has_value);
+                push_or_replace(builder, v as i32, flags);
                 Ok(n)
             }
             Self::EnumString {
@@ -1348,7 +1349,7 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                push_or_replace(builder, v as i64, has_value);
+                push_or_replace(builder, v as i64, flags);
                 Ok(n)
             }
             Self::UInt32 { builder, .. } => {
@@ -1356,7 +1357,7 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                push_or_replace(builder, v as u32, has_value);
+                push_or_replace(builder, v as u32, flags);
                 Ok(n)
             }
             Self::UInt64 { builder, .. } => {
@@ -1364,7 +1365,7 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                push_or_replace(builder, v, has_value);
+                push_or_replace(builder, v, flags);
                 Ok(n)
             }
             Self::Sint32 { builder, .. } => {
@@ -1372,7 +1373,7 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                push_or_replace(builder, decode_zigzag32(v), has_value);
+                push_or_replace(builder, decode_zigzag32(v), flags);
                 Ok(n)
             }
             Self::Sint64 { builder, .. } => {
@@ -1380,44 +1381,44 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                push_or_replace(builder, decode_zigzag64(v), has_value);
+                push_or_replace(builder, decode_zigzag64(v), flags);
                 Ok(n)
             }
             Self::Sfixed32 { builder, .. } => {
                 if wire_type != 5 {
                     return skip_field(wire_type, buf);
                 }
-                push_or_replace_with(builder, buf, has_value, i32::from_le_bytes)
+                push_or_replace_with(builder, buf, flags, i32::from_le_bytes)
             }
             Self::Sfixed64 { builder, .. } => {
                 if wire_type != 1 {
                     return skip_field(wire_type, buf);
                 }
-                push_or_replace_with(builder, buf, has_value, i64::from_le_bytes)
+                push_or_replace_with(builder, buf, flags, i64::from_le_bytes)
             }
             Self::Fixed32 { builder, .. } => {
                 if wire_type != 5 {
                     return skip_field(wire_type, buf);
                 }
-                push_or_replace_with(builder, buf, has_value, u32::from_le_bytes)
+                push_or_replace_with(builder, buf, flags, u32::from_le_bytes)
             }
             Self::Fixed64 { builder, .. } => {
                 if wire_type != 1 {
                     return skip_field(wire_type, buf);
                 }
-                push_or_replace_with(builder, buf, has_value, u64::from_le_bytes)
+                push_or_replace_with(builder, buf, flags, u64::from_le_bytes)
             }
             Self::Float { builder, .. } => {
                 if wire_type != 5 {
                     return skip_field(wire_type, buf);
                 }
-                push_or_replace_with(builder, buf, has_value, f32::from_le_bytes)
+                push_or_replace_with(builder, buf, flags, f32::from_le_bytes)
             }
             Self::Double { builder, .. } => {
                 if wire_type != 1 {
                     return skip_field(wire_type, buf);
                 }
-                push_or_replace_with(builder, buf, has_value, f64::from_le_bytes)
+                push_or_replace_with(builder, buf, flags, f64::from_le_bytes)
             }
             Self::Bool {
                 value, has_value, ..
@@ -1435,7 +1436,7 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                builder.push_or_replace(validate_utf8(data)?, has_value);
+                builder.push_or_replace(validate_utf8(data)?, flags);
                 Ok(total)
             }
             Self::Bytes { builder, .. } => {
@@ -1443,7 +1444,7 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                builder.push_or_replace(data, has_value);
+                builder.push_or_replace(data, flags);
                 Ok(total)
             }
             // Well-known types: decode submessage
@@ -1689,24 +1690,25 @@ impl FieldDecoder {
         let (data, total) = read_length_delimited(buf)?;
         // Parse entry submessage: field 1 = key, field 2 = value
         let mut pos = 0;
-        let (mut key_seen, mut value_seen) = (false, false);
+        let (mut key_flags, mut value_flags) = (FieldFlags::empty(), FieldFlags::empty());
         while pos < data.len() {
             let (fnum, wt, n) = decode_tag(&data[pos..])?;
             pos += n;
             if fnum == 1 {
-                pos += key_decoder.decode(wt, &data[pos..], &mut key_seen)?;
+                pos += key_decoder.decode(wt, &data[pos..], &mut key_flags)?;
             } else if fnum == 2 {
-                pos += value_decoder.decode(wt, &data[pos..], &mut value_seen)?;
+                pos += value_decoder.decode(wt, &data[pos..], &mut value_flags)?;
             } else {
                 pos += skip_field(wt, &data[pos..])?;
             }
         }
-        // Map keys and values have no presence, even in proto2.
-        if !key_seen {
-            key_decoder.flush(false);
+        // Map keys and values have no presence, even in proto2, so
+        // their flags never get `HAS_PRESENCE`.
+        if !key_flags.contains(FieldFlags::HAS_VALUE) {
+            key_decoder.flush(key_flags);
         }
-        if !value_seen {
-            value_decoder.flush(false);
+        if !value_flags.contains(FieldFlags::HAS_VALUE) {
+            value_decoder.flush(value_flags);
         }
         Ok(total)
     }
@@ -1734,9 +1736,10 @@ impl FieldDecoder {
         })
     }
 
-    /// Ends a row for this field. `has_presence`: an absent value is null,
-    /// not the default.
-    fn flush(&mut self, has_presence: bool) {
+    /// Ends a row for this field: an absent value is null with
+    /// [`FieldFlags::HAS_PRESENCE`], the default otherwise.
+    fn flush(&mut self, flags: FieldFlags) {
+        let has_presence = flags.contains(FieldFlags::HAS_PRESENCE);
         match self {
             // Appended in decode; flushed only when absent from the row.
             Self::Int32 { builder } | Self::Sint32 { builder } | Self::Sfixed32 { builder } => {
@@ -2259,15 +2262,23 @@ fn decode_repeated_wrapper_fixed64<T: ArrowPrimitiveType>(
 // MessageDecoder
 // ---------------------------------------------------------------------------
 
+bitflags::bitflags! {
+    /// Per-field flags of a [`MessageDecoder`].
+    #[derive(Clone, Copy)]
+    struct FieldFlags: u8 {
+        /// The decoder appended its value directly in the current row (see
+        /// [`FieldDecoder::decode`]).
+        const HAS_VALUE = 1;
+        /// [`FieldDescriptor::supports_presence`]: an absent value is null.
+        const HAS_PRESENCE = 1 << 1;
+    }
+}
+
 /// One field of a [`MessageDecoder`].
 struct DecoderState {
     decoder: FieldDecoder,
     field: FieldDescriptor,
-    /// The decoder appended its value directly in the current row (see
-    /// [`FieldDecoder::decode`]).
-    has_value: bool,
-    /// [`FieldDescriptor::supports_presence`]: an absent value is null.
-    has_presence: bool,
+    flags: FieldFlags,
 }
 
 pub struct MessageDecoder {
@@ -2315,11 +2326,12 @@ impl MessageDecoder {
                 if field.number() > max_field_number {
                     max_field_number = field.number();
                 }
+                let mut flags = FieldFlags::empty();
+                flags.set(FieldFlags::HAS_PRESENCE, field.supports_presence());
                 decoders.push(DecoderState {
                     decoder,
-                    has_presence: field.supports_presence(),
                     field,
-                    has_value: false,
+                    flags,
                 });
             }
         }
@@ -2358,10 +2370,8 @@ impl MessageDecoder {
                 None
             };
             if let Some(idx) = idx {
-                let DecoderState {
-                    decoder, has_value, ..
-                } = &mut self.decoders[idx];
-                pos += decoder.decode(wire_type, &buf[pos..], has_value)?;
+                let DecoderState { decoder, flags, .. } = &mut self.decoders[idx];
+                pos += decoder.decode(wire_type, &buf[pos..], flags)?;
             } else {
                 pos += skip_field(wire_type, &buf[pos..])?;
             }
@@ -2384,10 +2394,8 @@ impl MessageDecoder {
                 None
             };
             if let Some(idx) = idx {
-                let DecoderState {
-                    decoder, has_value, ..
-                } = &mut self.decoders[idx];
-                pos += decoder.decode(wire_type, &buf[pos..], has_value)?;
+                let DecoderState { decoder, flags, .. } = &mut self.decoders[idx];
+                pos += decoder.decode(wire_type, &buf[pos..], flags)?;
             } else {
                 pos += skip_field(wire_type, &buf[pos..])?;
             }
@@ -2396,19 +2404,14 @@ impl MessageDecoder {
     }
 
     /// Ends a row: flushes every decoder that did not append its value
-    /// directly (see [`FieldDecoder::decode`]) and clears `has_value`.
+    /// directly (see [`FieldDecoder::decode`]) and clears
+    /// [`FieldFlags::HAS_VALUE`].
     fn flush_unseen(&mut self) {
-        for DecoderState {
-            decoder,
-            has_value,
-            has_presence,
-            ..
-        } in &mut self.decoders
-        {
-            if !*has_value {
-                decoder.flush(*has_presence);
+        for DecoderState { decoder, flags, .. } in &mut self.decoders {
+            if !flags.contains(FieldFlags::HAS_VALUE) {
+                decoder.flush(*flags);
             }
-            *has_value = false;
+            flags.remove(FieldFlags::HAS_VALUE);
         }
     }
 
