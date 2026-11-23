@@ -6355,4 +6355,18 @@ mod tests {
         assert_eq!(decode(false, &mismatched), (true, decode(false, &[]).1));
         assert!(!decode(true, &mismatched).0);
     }
+
+    /// A length prefix near `u64::MAX`, on a known or an unknown field, fails
+    /// the message instead of overflowing.
+    #[test]
+    fn test_huge_length_prefix_fails() {
+        let descriptor = message_of("Huge", vec![scalar_field("s", 1, Type::String)]);
+        let u64_max = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        // 0x0a = field 1 (s), wire type 2; 0x9a 0x06 = field 99, wire type 2.
+        for tag in [&[0x0a][..], &[0x9a, 0x06]] {
+            let message = [tag, &u64_max, b"abc"].concat();
+            let mut decoder = MessageDecoder::new(&descriptor, &PtarsConfig::default());
+            assert!(decoder.decode_row(&message).is_err(), "tag {tag:?}");
+        }
+    }
 }
