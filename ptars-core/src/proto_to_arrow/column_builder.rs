@@ -42,10 +42,6 @@ impl ByteColumn {
         }
     }
 
-    pub(super) fn len(&self) -> usize {
-        self.offsets.len() - 1
-    }
-
     #[inline(always)]
     pub(super) fn push(&mut self, value: &[u8]) {
         self.values.extend_from_slice(value);
@@ -121,10 +117,6 @@ pub(super) struct StringColumn(ByteColumn);
 impl StringColumn {
     pub(super) fn with_capacity(large: bool, rows: usize) -> Self {
         Self(ByteColumn::with_capacity(large, rows))
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.0.len()
     }
 
     #[inline]

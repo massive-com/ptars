@@ -1027,6 +1027,9 @@ enum FieldDecoder {
         key_flags: FieldFlags,
         value_flags: FieldFlags,
         offsets: Vec<i32>,
+        /// Entries decoded in the current row; [`FieldDecoder::flush`] adds
+        /// them to `offsets`.
+        row_entries: i32,
         map_value_name: Arc<str>,
         map_value_nullable: bool,
     },
@@ -1595,6 +1598,7 @@ impl FieldDecoder {
                 value_decoder,
                 key_flags,
                 value_flags,
+                row_entries,
                 ..
             } => Self::decode_map_entry(
                 wire_type,
@@ -1603,6 +1607,7 @@ impl FieldDecoder {
                 value_decoder,
                 *key_flags,
                 *value_flags,
+                row_entries,
             ),
         }
     }
@@ -1619,6 +1624,7 @@ impl FieldDecoder {
         value_decoder: &mut FieldDecoder,
         key_start: FieldFlags,
         value_start: FieldFlags,
+        row_entries: &mut i32,
     ) -> Result<usize, prost::DecodeError> {
         if wire_type != 2 {
             return skip_field(wire_type, buf);
@@ -1644,30 +1650,8 @@ impl FieldDecoder {
         if value_flags.needs_flush() {
             value_decoder.flush(value_flags);
         }
+        *row_entries += 1;
         Ok(total)
-    }
-
-    /// Number of values this singular decoder has appended to its builder. Used by the
-    /// map decoder to compute entry offsets from its key decoder; covers exactly the
-    /// kinds protobuf allows as map keys (integers, bool, string), `None` otherwise.
-    fn appended_len(&self) -> Option<usize> {
-        Some(match self {
-            Self::Int32 { builder, .. }
-            | Self::Sint32 { builder, .. }
-            | Self::Sfixed32 { builder, .. } => ArrayBuilder::len(builder),
-            Self::Int64 { builder, .. }
-            | Self::Sint64 { builder, .. }
-            | Self::Sfixed64 { builder, .. } => ArrayBuilder::len(builder),
-            Self::UInt32 { builder, .. } | Self::Fixed32 { builder, .. } => {
-                ArrayBuilder::len(builder)
-            }
-            Self::UInt64 { builder, .. } | Self::Fixed64 { builder, .. } => {
-                ArrayBuilder::len(builder)
-            }
-            Self::Bool { builder, .. } => ArrayBuilder::len(builder),
-            Self::String { builder, .. } => builder.len(),
-            _ => return None,
-        })
     }
 
     /// Ends a row for this field. [`FieldFlags::HAS_VALUE`]: the field
@@ -1850,19 +1834,13 @@ impl FieldDecoder {
             Self::Repeated { inner, offsets, .. } => {
                 offsets.push(inner.len());
             }
-            // Map: push offset based on key builder length
             Self::Map {
-                key_decoder,
                 offsets,
+                row_entries,
                 ..
             } => {
-                // Every key kind protobuf allows must be covered here: a kind that falls
-                // through leaves the offsets where they were and silently drops every
-                // entry of the map (fixed32/fixed64/sfixed32/sfixed64 keys used to).
-                let count = key_decoder
-                    .appended_len()
-                    .unwrap_or(*offsets.last().unwrap() as usize);
-                offsets.push(count as i32);
+                let end = offsets.last().unwrap() + std::mem::take(row_entries);
+                offsets.push(end);
             }
         }
     }
@@ -2669,6 +2647,7 @@ fn build_map_decoder(
         key_decoder: Box::new(key_decoder),
         value_decoder: Box::new(value_decoder),
         offsets: vec![0],
+        row_entries: 0,
         map_value_name: config.map_value_name.clone(),
         map_value_nullable: config.map_value_nullable,
     })
