@@ -49,5 +49,5 @@ pub use arrow_to_proto::record_batch_to_array;
 pub use config::{ConfluentWirePolicy, EnumRepr, PtarsConfig, TimeUnit};
 pub use proto_to_arrow::{
     binary_array_to_messages, binary_array_to_record_batch_direct, messages_to_record_batch,
-    messages_to_record_batch_with_config, MessageDecoder,
+    messages_to_record_batch_with_config, DecoderPlan, MessageDecoder,
 };

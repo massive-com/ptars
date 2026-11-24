@@ -4,7 +4,7 @@ mod tests {
     use crate::config::{EnumRepr, PtarsConfig};
     use crate::proto_to_arrow::{
         binary_array_to_record_batch_direct, messages_to_record_batch,
-        messages_to_record_batch_with_config, MessageDecoder,
+        messages_to_record_batch_with_config, DecoderPlan, MessageDecoder,
     };
     use arrow::array::Array;
     use arrow_array::BinaryArray;
@@ -6318,9 +6318,9 @@ mod tests {
         assert!(decode_around(&map, &good, &bad));
     }
 
-    /// A decoder reused through `finish_batch` gives each batch what a fresh
-    /// decoder would: nested messages, lists of both offset sizes, maps and
-    /// an empty batch.
+    /// A decoder reused through `finish_batch`, and a decoder built from a
+    /// `DecoderPlan`, give each batch what a fresh decoder would: nested
+    /// messages, lists of both offset sizes, maps and an empty batch.
     #[test]
     fn test_finish_batch_matches_fresh_decoder() {
         let merge = merge_fixture();
@@ -6347,13 +6347,18 @@ mod tests {
             ] {
                 // Presized, so finish_batch sizes its builders again.
                 let mut reused = MessageDecoder::with_capacity(&descriptor, &config, 4);
+                let plan = DecoderPlan::new(&descriptor, &config);
                 for batch in &batches {
                     let mut fresh = MessageDecoder::new(&descriptor, &config);
+                    let mut planned = plan.decoder(4);
                     for message in batch {
                         reused.decode_row(message).unwrap();
                         fresh.decode_row(message).unwrap();
+                        planned.decode_row(message).unwrap();
                     }
-                    assert_eq!(reused.finish_batch(), fresh.finish());
+                    let expected = fresh.finish();
+                    assert_eq!(reused.finish_batch(), expected);
+                    assert_eq!(planned.finish(), expected);
                 }
             }
         }
