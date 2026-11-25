@@ -5625,6 +5625,59 @@ mod tests {
         );
     }
 
+    /// A repeated TimeOfDay reads its fields as int32, like a singular one,
+    /// so hours outside int32 on the wire can't overflow i64.
+    #[test]
+    fn test_repeated_time_of_day_reads_int32_hours() {
+        let mut pool = create_time_of_day_pool();
+        let field = |name: &str, number, label: Label| FieldDescriptorProto {
+            name: Some(name.to_string()),
+            number: Some(number),
+            label: Some(label.into()),
+            r#type: Some(Type::Message.into()),
+            type_name: Some(".google.type.TimeOfDay".to_string()),
+            ..Default::default()
+        };
+        pool.add_file_descriptor_proto(FileDescriptorProto {
+            name: Some("test.proto".to_string()),
+            package: Some("test".to_string()),
+            syntax: Some("proto3".to_string()),
+            dependency: vec!["google/type/timeofday.proto".to_string()],
+            message_type: vec![DescriptorProto {
+                name: Some("WithTimeOfDay".to_string()),
+                field: vec![
+                    field("one", 1, Label::Optional),
+                    field("many", 2, Label::Repeated),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let descriptor = pool.get_message_by_name("test.WithTimeOfDay").unwrap();
+
+        let mut time_of_day = wire_tag(1, 0);
+        time_of_day.extend(wire_varint((1 << 62) + 5));
+        let mut row = Vec::new();
+        for field in [1, 2] {
+            row.extend(wire_tag(field, 2));
+            row.extend(wire_varint(time_of_day.len() as u64));
+            row.extend(&time_of_day);
+        }
+        let batch = binary_array_to_record_batch_direct(
+            &BinaryArray::from(vec![row.as_slice()]),
+            &descriptor,
+            &PtarsConfig::default(),
+        )
+        .unwrap();
+        let many = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .unwrap();
+        assert_eq!(batch.column(0).as_ref(), many.value(0).as_ref());
+    }
+
     fn wire_varint(mut v: u64) -> Vec<u8> {
         let mut out = Vec::new();
         loop {

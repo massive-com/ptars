@@ -734,7 +734,10 @@ impl RepeatedInner {
                 }
                 let (data, total) = read_length_delimited(buf)?;
                 let vals = decode_wkt_submessage(data, 4)?;
-                let total_seconds = vals[0] * 3600 + vals[1] * 60 + vals[2];
+                // int32 fields, as in the singular path: cannot overflow i64.
+                let total_seconds = i64::from(vals[0] as i32) * 3600
+                    + i64::from(vals[1] as i32) * 60
+                    + i64::from(vals[2] as i32);
                 values_builder.append_value(convert_seconds_nanos_to_unit(
                     total_seconds,
                     vals[3] as i32,
