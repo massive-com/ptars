@@ -2,13 +2,18 @@
 mod tests {
     use crate::arrow_to_proto::record_batch_to_array;
     use crate::config::PtarsConfig;
-    use crate::proto_to_arrow::{messages_to_record_batch, messages_to_record_batch_with_config};
+    use crate::proto_to_arrow::{
+        binary_array_to_record_batch_direct, messages_to_record_batch,
+        messages_to_record_batch_with_config,
+    };
     use arrow::array::Array;
+    use arrow_array::BinaryArray;
+    use prost::Message;
     use prost_reflect::prost_types::{
         field_descriptor_proto::{Label, Type},
-        DescriptorProto, FieldDescriptorProto, FileDescriptorProto,
+        DescriptorProto, FieldDescriptorProto, FileDescriptorProto, OneofDescriptorProto,
     };
-    use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor, Value};
+    use prost_reflect::{DescriptorPool, DynamicMessage, Kind, MessageDescriptor, Value};
 
     fn file_descriptor_proto_fixture() -> FileDescriptorProto {
         FileDescriptorProto {
@@ -5875,5 +5880,183 @@ mod tests {
         assert_eq!(names.value(0), b"UNKNOWN");
         assert_eq!(names.value(1), b"ACTIVE");
         assert_eq!(names.value(2), b"INACTIVE");
+    }
+
+    fn scalar_field(name: &str, number: i32, ty: Type) -> FieldDescriptorProto {
+        FieldDescriptorProto {
+            name: Some(name.to_string()),
+            number: Some(number),
+            label: Some(Label::Optional.into()),
+            r#type: Some(ty.into()),
+            ..Default::default()
+        }
+    }
+
+    /// A message with every singular scalar kind, a proto3 `optional`, a
+    /// nested message, and repeated numbers and messages.
+    fn merge_fixture() -> MessageDescriptor {
+        let scalars = [
+            Type::Int32,
+            Type::Int64,
+            Type::Uint32,
+            Type::Uint64,
+            Type::Sint32,
+            Type::Sint64,
+            Type::Sfixed32,
+            Type::Sfixed64,
+            Type::Fixed32,
+            Type::Fixed64,
+            Type::Float,
+            Type::Double,
+            Type::String,
+            Type::Bytes,
+            Type::Bool,
+        ];
+        let mut fields: Vec<_> = scalars
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| scalar_field(&format!("f{}", i + 1), i as i32 + 1, *ty))
+            .collect();
+        fields.push(FieldDescriptorProto {
+            type_name: Some(".test.Inner".to_string()),
+            ..scalar_field("inner", 16, Type::Message)
+        });
+        fields.push(FieldDescriptorProto {
+            label: Some(Label::Repeated.into()),
+            type_name: Some(".test.Inner".to_string()),
+            ..scalar_field("items", 20, Type::Message)
+        });
+        fields.push(FieldDescriptorProto {
+            label: Some(Label::Repeated.into()),
+            ..scalar_field("rep", 17, Type::Int32)
+        });
+        fields.push(FieldDescriptorProto {
+            oneof_index: Some(0),
+            proto3_optional: Some(true),
+            ..scalar_field("opt", 18, Type::Int64)
+        });
+        let file_descriptor = FileDescriptorProto {
+            name: Some("merge.proto".to_string()),
+            package: Some("test".to_string()),
+            syntax: Some("proto3".to_string()),
+            message_type: vec![
+                DescriptorProto {
+                    name: Some("Inner".to_string()),
+                    field: vec![
+                        scalar_field("a", 1, Type::Int32),
+                        scalar_field("s", 2, Type::String),
+                        FieldDescriptorProto {
+                            label: Some(Label::Repeated.into()),
+                            ..scalar_field("rep", 3, Type::Int32)
+                        },
+                    ],
+                    ..Default::default()
+                },
+                DescriptorProto {
+                    name: Some("Merge".to_string()),
+                    field: fields,
+                    oneof_decl: vec![OneofDescriptorProto {
+                        name: Some("_opt".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        create_pool_with_message(file_descriptor)
+            .get_message_by_name("test.Merge")
+            .unwrap()
+    }
+
+    /// Sets a seed-dependent subset of `descriptor`'s fields.
+    fn merge_sample(descriptor: &MessageDescriptor, seed: i64) -> DynamicMessage {
+        let mut message = DynamicMessage::new(descriptor.clone());
+        for field in descriptor.fields() {
+            let n = seed * 31 + i64::from(field.number()) * 7;
+            if n % 3 == 0 {
+                continue;
+            }
+            let value = match field.kind() {
+                Kind::Message(inner) if field.is_list() => Value::List(vec![
+                    Value::Message(merge_sample(&inner, seed + 2)),
+                    Value::Message(merge_sample(&inner, seed + 3)),
+                ]),
+                _ if field.is_list() => Value::List(vec![Value::I32(n as i32), Value::I32(-1)]),
+                Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => Value::I32(n as i32 - 50),
+                Kind::Int64 | Kind::Sint64 | Kind::Sfixed64 => Value::I64(n * 1_000_000_007 - 99),
+                Kind::Uint32 | Kind::Fixed32 => Value::U32(n as u32),
+                Kind::Uint64 | Kind::Fixed64 => Value::U64(n as u64 * 1_000_000_007),
+                Kind::Float => Value::F32(n as f32 / 4.0),
+                Kind::Double => Value::F64(n as f64 / 8.0),
+                Kind::Bool => Value::Bool(n % 2 == 0),
+                Kind::String => Value::String(format!("s{n}")),
+                Kind::Bytes => Value::Bytes(format!("b{n}").into_bytes().into()),
+                Kind::Message(inner) => Value::Message(merge_sample(&inner, seed + 1)),
+                Kind::Enum(_) => unreachable!(),
+            };
+            message.set_field(&field, value);
+        }
+        message
+    }
+
+    /// Decodes `rows`, one serialized message each, into a batch.
+    fn decode_raw<T: AsRef<[u8]>>(
+        descriptor: &MessageDescriptor,
+        rows: &[T],
+        config: &PtarsConfig,
+    ) -> arrow_array::RecordBatch {
+        let array = BinaryArray::from_iter_values(rows);
+        binary_array_to_record_batch_direct(&array, descriptor, config).unwrap()
+    }
+
+    /// Decoding each row's concatenated messages matches decoding the message
+    /// they merge into.
+    fn assert_concatenation_merges(
+        descriptor: &MessageDescriptor,
+        rows: &[Vec<DynamicMessage>],
+        configs: &[PtarsConfig],
+    ) {
+        let raw: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|parts| parts.iter().flat_map(|m| m.encode_to_vec()).collect())
+            .collect();
+        let merged: Vec<Vec<u8>> = raw
+            .iter()
+            .map(|bytes| {
+                DynamicMessage::decode(descriptor.clone(), bytes.as_slice())
+                    .unwrap()
+                    .encode_to_vec()
+            })
+            .collect();
+        for config in configs {
+            assert_eq!(
+                decode_raw(descriptor, &raw, config),
+                decode_raw(descriptor, &merged, config)
+            );
+        }
+    }
+
+    #[test]
+    fn test_concatenated_messages_merge() {
+        let descriptor = merge_fixture();
+        let rows: Vec<_> = (0..12)
+            .map(|seed| {
+                let mut parts = vec![merge_sample(&descriptor, seed)];
+                if seed % 4 != 3 {
+                    parts.push(merge_sample(&descriptor, seed * 5 + 1));
+                }
+                if seed % 4 == 1 {
+                    parts.push(merge_sample(&descriptor, seed * 7 + 2));
+                }
+                parts
+            })
+            .collect();
+        let large = PtarsConfig {
+            use_large_string: true,
+            use_large_binary: true,
+            ..PtarsConfig::default()
+        };
+        assert_concatenation_merges(&descriptor, &rows, &[PtarsConfig::default(), large]);
     }
 }

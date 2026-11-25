@@ -56,6 +56,15 @@ fn pool() -> DescriptorPool {
                     field("receive_time", 8, Type::Int64),
                 ],
             ),
+            // Reads `Flat` messages knowing 3 of their 8 fields: the rest are unknown fields.
+            message(
+                "FlatSubset",
+                vec![
+                    field("ask_price", 3, Type::Double),
+                    field("bid_price", 5, Type::Double),
+                    field("event_time", 7, Type::Int64),
+                ],
+            ),
             message(
                 "Base",
                 vec![
@@ -141,12 +150,13 @@ fn bench_shape(
     c: &mut Criterion,
     name: &str,
     descriptor: &MessageDescriptor,
+    writer: &MessageDescriptor,
     encode: fn(&MessageDescriptor, usize) -> Vec<u8>,
 ) {
     let config = PtarsConfig::default();
     let mut group = c.benchmark_group(name);
     for n in BATCH_SIZES {
-        let owned: Vec<Vec<u8>> = (0..n).map(|i| encode(descriptor, i)).collect();
+        let owned: Vec<Vec<u8>> = (0..n).map(|i| encode(writer, i)).collect();
         let binary = BinaryArray::from_iter_values(&owned);
         let bytes: usize = owned.iter().map(Vec::len).sum();
         group.throughput(Throughput::Bytes(bytes as u64));
@@ -160,16 +170,19 @@ fn bench_shape(
 
 fn bench_decode(c: &mut Criterion) {
     let pool = pool();
-    for (name, message, encode) in [
+    for (name, message, writer, encode) in [
         (
             "flat",
             "bench.Flat",
+            "bench.Flat",
             flat as fn(&MessageDescriptor, usize) -> Vec<u8>,
         ),
-        ("nested", "bench.Nested", nested),
+        ("nested", "bench.Nested", "bench.Nested", nested),
+        ("unknown", "bench.FlatSubset", "bench.Flat", flat),
     ] {
         let descriptor = pool.get_message_by_name(message).unwrap();
-        bench_shape(c, name, &descriptor, encode);
+        let writer = pool.get_message_by_name(writer).unwrap();
+        bench_shape(c, name, &descriptor, &writer, encode);
     }
 }
 
