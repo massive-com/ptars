@@ -13,17 +13,20 @@ use arrow_array::types::{
     Date32Type, Float32Type, Float64Type, Int32Type, Int64Type, UInt32Type, UInt64Type,
 };
 use arrow_array::{Array, ArrowPrimitiveType, BinaryArray, MapArray, RecordBatch, StructArray};
-use arrow_schema::{DataType, Field, Fields, TimeUnit};
+use arrow_schema::{DataType, Field, TimeUnit};
 use chrono::Datelike;
 
-use prost_reflect::{EnumDescriptor, FieldDescriptor, Kind, MessageDescriptor};
+use prost_reflect::{EnumDescriptor, Kind, MessageDescriptor};
 
 use crate::config::{ConfluentWirePolicy, EnumRepr, PtarsConfig};
 
 mod column_builder;
+mod plan;
 mod wire_types;
 
 use column_builder::{validate_utf8, ByteColumn, StringColumn};
+pub use plan::DecoderPlan;
+use plan::{FieldPlan, FieldShape};
 use wire_types::WireTypes;
 
 // ---------------------------------------------------------------------------
@@ -256,13 +259,14 @@ fn date_to_days_from_epoch(year: i32, month: i32, day: i32) -> i32 {
     }
 }
 
-/// Precomputed number → name table for one enum, built once when the field decoder is
-/// constructed.
+/// Precomputed number → name table for one enum, built once per [`DecoderPlan`] and
+/// shared by its decoders.
 ///
 /// Looking the name up through `EnumDescriptor::get_value` and allocating a fresh `String` for
 /// every decoded value was the hot path of string-represented enums on busy topics. The table
 /// returns a borrowed `&str` for declared values; numbers outside the declared set — which
 /// protobuf permits — are formatted on the fly, as before.
+#[derive(Debug)]
 struct EnumNames {
     by_number: HashMap<i32, String>,
     /// The enum's first value, for an absent field without presence.
@@ -469,11 +473,11 @@ enum RepeatedInner {
     },
     EnumString {
         values_builder: StringBuilderInner,
-        enum_names: EnumNames,
+        enum_names: Arc<EnumNames>,
     },
     EnumBinary {
         values_builder: BinaryBuilderInner,
-        enum_names: EnumNames,
+        enum_names: Arc<EnumNames>,
     },
     Message {
         sub_decoder: MessageDecoder,
@@ -946,11 +950,11 @@ enum FieldDecoder {
     },
     EnumString {
         builder: StringColumn,
-        enum_names: EnumNames,
+        enum_names: Arc<EnumNames>,
     },
     EnumBinary {
         builder: ByteColumn,
-        enum_names: EnumNames,
+        enum_names: Arc<EnumNames>,
     },
 
     // --- Well-known types (singular, buffered) ---
@@ -2119,7 +2123,6 @@ impl FieldFlags {
 /// One field of a [`MessageDecoder`].
 struct DecoderState {
     decoder: FieldDecoder,
-    field: FieldDescriptor,
     flags: FieldFlags,
     /// [`WireTypes::ALL`] unless [`PtarsConfig::strict_wire_types`].
     wire_types: WireTypes,
@@ -2129,14 +2132,11 @@ struct DecoderState {
 /// [`MessageDecoder::decode_row`] call; [`MessageDecoder::finish`] returns
 /// the batch.
 pub struct MessageDecoder {
-    /// One per field, in field order.
+    /// One per field of the plan, in the same order.
     decoders: Vec<DecoderState>,
-    tag_map: Vec<Option<usize>>,
-    list_nullable: bool,
-    map_nullable: bool,
+    plan: DecoderPlan,
     num_rows: usize,
     capacity: usize,
-    fields: Option<Fields>,
 }
 
 impl MessageDecoder {
@@ -2148,74 +2148,15 @@ impl MessageDecoder {
 
     /// Like [`MessageDecoder::new`], with the builders of singular scalar
     /// fields sized for `capacity` rows.
+    ///
+    /// To build many decoders for one message type, build them from a
+    /// [`DecoderPlan`], which reads the descriptor once.
     pub fn with_capacity(
         descriptor: &MessageDescriptor,
         config: &PtarsConfig,
         capacity: usize,
     ) -> Self {
-        Self::new_inner(descriptor, config, capacity, &mut Vec::new())
-    }
-
-    /// `ancestors` is the chain of message types currently being built, root first. A field
-    /// whose message type is already in the chain is a back-edge of a recursive proto (a
-    /// message containing itself, directly or through a cycle — `Tree.children`,
-    /// `google.protobuf.Struct` → `Value` → `Struct`). Recursing into it would never terminate
-    /// and overflowed the stack; such a field decodes as the raw protobuf bytes of the nested
-    /// message instead (`Binary`, or `List<Binary>` when repeated).
-    fn new_inner(
-        descriptor: &MessageDescriptor,
-        config: &PtarsConfig,
-        capacity: usize,
-        ancestors: &mut Vec<String>,
-    ) -> Self {
-        ancestors.push(descriptor.full_name().to_string());
-        let mut decoders = Vec::new();
-        let mut max_field_number: u32 = 0;
-
-        for field in descriptor.fields() {
-            if let Some((decoder, mut flags)) =
-                build_field_decoder(&field, config, capacity, ancestors)
-            {
-                if field.number() > max_field_number {
-                    max_field_number = field.number();
-                }
-                flags.set(FieldFlags::HAS_PRESENCE, field.supports_presence());
-                decoders.push(DecoderState {
-                    wire_types: if config.strict_wire_types {
-                        WireTypes::of(&field)
-                    } else {
-                        WireTypes::ALL
-                    },
-                    decoder,
-                    field,
-                    flags,
-                });
-            }
-        }
-        ancestors.pop();
-
-        let mut tag_map = vec![
-            None;
-            if max_field_number == 0 {
-                0
-            } else {
-                max_field_number as usize + 1
-            }
-        ];
-        for (idx, DecoderState { field, .. }) in decoders.iter().enumerate() {
-            let num = field.number() as usize;
-            tag_map[num] = Some(idx);
-        }
-
-        Self {
-            decoders,
-            tag_map,
-            list_nullable: config.list_nullable,
-            map_nullable: config.map_nullable,
-            num_rows: 0,
-            capacity,
-            fields: None,
-        }
+        DecoderPlan::new(descriptor, config).decoder(capacity)
     }
 
     /// Decodes one serialized message as the next row.
@@ -2237,23 +2178,19 @@ impl MessageDecoder {
     /// [`FieldDecoder::flush`] does.
     #[inline(always)]
     fn decode_fields(&mut self, buf: &[u8]) -> Result<(), prost::DecodeError> {
+        let tag_map = self.plan.0.tag_map.as_slice();
         let mut pos = 0;
         while pos < buf.len() {
-            let (field_num, wire_type, n) = decode_tag(&buf[pos..])?;
+            let (field_number, wire_type, n) = decode_tag(&buf[pos..])?;
             pos += n;
-            let idx = if (field_num as usize) < self.tag_map.len() {
-                self.tag_map[field_num as usize]
-            } else {
-                None
-            };
-            if let Some(idx) = idx {
+            if let Some(&Some(idx)) = tag_map.get(field_number as usize) {
                 let DecoderState {
                     decoder,
                     flags,
                     wire_types,
                     ..
                 } = &mut self.decoders[idx];
-                wire_types.check(field_num, wire_type)?;
+                wire_types.check(field_number, wire_type)?;
                 pos += decoder.decode(wire_type, &buf[pos..], flags)?;
             } else {
                 pos += skip_field(wire_type, &buf[pos..])?;
@@ -2315,19 +2252,18 @@ impl MessageDecoder {
             .map(|DecoderState { decoder, .. }| decoder.finish(capacity))
             .collect();
 
-        let fields = self.fields.get_or_insert_with(|| {
-            self.decoders
+        let plan = &*self.plan.0;
+        let fields = plan.schema.get_or_init(|| {
+            plan.fields
                 .iter()
                 .zip(&columns)
-                .map(|(DecoderState { field, .. }, column)| {
-                    let nullable = if field.is_list() {
-                        self.list_nullable
-                    } else if field.is_map() {
-                        self.map_nullable
-                    } else {
-                        field.supports_presence()
+                .map(|(field, column)| {
+                    let nullable = match field.shape {
+                        FieldShape::List => plan.config.list_nullable,
+                        FieldShape::Map { .. } => plan.config.map_nullable,
+                        FieldShape::Singular => field.has_presence,
                     };
-                    Field::new(field.name(), column.data_type().clone(), nullable)
+                    Field::new(field.field.name(), column.data_type().clone(), nullable)
                 })
                 .collect()
         });
@@ -2373,30 +2309,25 @@ impl MessageDecoder {
 // build_field_decoder
 // ---------------------------------------------------------------------------
 
-/// The decoder for `field`, with [`FieldFlags::BUFFERED`] set where it
-/// needs it. `capacity`: rows to size scalar builders for (0 when unknown).
+/// The decoder for the field `plan` describes, with [`FieldFlags::BUFFERED`]
+/// set where it needs it. `capacity`: rows to size scalar builders for (0
+/// when unknown).
 fn build_field_decoder(
-    field: &FieldDescriptor,
+    plan: &FieldPlan,
     config: &PtarsConfig,
     capacity: usize,
-    ancestors: &mut Vec<String>,
-) -> Option<(FieldDecoder, FieldFlags)> {
-    if field.is_map() {
-        return Some((
-            build_map_decoder(field, config, ancestors)?,
-            FieldFlags::BUFFERED,
-        ));
-    }
-    if field.is_list() {
-        return Some((
-            build_repeated_decoder(field, config, ancestors)?,
-            FieldFlags::BUFFERED,
-        ));
+) -> (FieldDecoder, FieldFlags) {
+    match &plan.shape {
+        FieldShape::Map { key, value } => {
+            return (build_map_decoder(key, value, config), FieldFlags::BUFFERED);
+        }
+        FieldShape::List => return (build_repeated_decoder(plan, config), FieldFlags::BUFFERED),
+        FieldShape::Singular => {}
     }
 
-    let direct = |decoder| Some((decoder, FieldFlags::empty()));
-    let buffered = |decoder| Some((decoder, FieldFlags::BUFFERED));
-    match field.kind() {
+    let direct = |decoder| (decoder, FieldFlags::empty());
+    let buffered = |decoder| (decoder, FieldFlags::BUFFERED);
+    match &plan.kind {
         Kind::Int32 => direct(FieldDecoder::Int32 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
@@ -2450,24 +2381,28 @@ fn build_field_decoder(
             }),
             EnumRepr::String => direct(FieldDecoder::EnumString {
                 builder: StringColumn::with_capacity(config.use_large_string, capacity),
-                enum_names: EnumNames::new(&enum_desc),
+                enum_names: plan.enum_names(),
             }),
             EnumRepr::Binary => direct(FieldDecoder::EnumBinary {
                 builder: ByteColumn::with_capacity(config.use_large_binary, capacity),
-                enum_names: EnumNames::new(&enum_desc),
+                enum_names: plan.enum_names(),
             }),
         },
-        Kind::Message(msg_desc) => build_message_field_decoder(msg_desc, config, ancestors),
+        Kind::Message(msg_desc) => {
+            build_message_field_decoder(msg_desc, plan.message.as_ref(), config)
+        }
     }
 }
 
+/// `plan`: the plan of `msg_desc`'s fields; `None` for a back-edge of a
+/// recursive message (see [`DecoderPlan::new`]), which decodes as its raw bytes.
 fn build_message_field_decoder(
-    msg_desc: MessageDescriptor,
+    msg_desc: &MessageDescriptor,
+    plan: Option<&DecoderPlan>,
     config: &PtarsConfig,
-    ancestors: &mut Vec<String>,
-) -> Option<(FieldDecoder, FieldFlags)> {
-    let direct = |decoder| Some((decoder, FieldFlags::empty()));
-    let buffered = |decoder| Some((decoder, FieldFlags::BUFFERED));
+) -> (FieldDecoder, FieldFlags) {
+    let direct = |decoder| (decoder, FieldFlags::empty());
+    let buffered = |decoder| (decoder, FieldFlags::BUFFERED);
     match msg_desc.full_name() {
         "google.protobuf.Timestamp" => buffered(FieldDecoder::Timestamp {
             seconds: 0,
@@ -2524,33 +2459,24 @@ fn build_message_field_decoder(
         "google.protobuf.BytesValue" => direct(FieldDecoder::WrapperBytes {
             builder: ByteColumn::with_capacity(config.use_large_binary, 0),
         }),
-        _ => {
-            // Recursion guard: a message type already being built higher in the chain
-            // decodes as its raw bytes (see MessageDecoder::new_inner).
-            if ancestors.iter().any(|a| a == msg_desc.full_name()) {
-                return direct(FieldDecoder::Bytes {
-                    builder: ByteColumn::with_capacity(config.use_large_binary, 0),
-                });
-            }
-            let sub_decoder = MessageDecoder::new_inner(&msg_desc, config, 0, ancestors);
-            buffered(FieldDecoder::Message {
-                sub_decoder: Box::new(sub_decoder),
+        _ => match plan {
+            Some(plan) => buffered(FieldDecoder::Message {
+                sub_decoder: Box::new(plan.decoder(0)),
                 is_valid: BooleanBuilder::new(),
-            })
-        }
+            }),
+            None => direct(FieldDecoder::Bytes {
+                builder: ByteColumn::with_capacity(config.use_large_binary, 0),
+            }),
+        },
     }
 }
 
-fn build_repeated_decoder(
-    field: &FieldDescriptor,
-    config: &PtarsConfig,
-    ancestors: &mut Vec<String>,
-) -> Option<FieldDecoder> {
+fn build_repeated_decoder(plan: &FieldPlan, config: &PtarsConfig) -> FieldDecoder {
     let ln = config.list_value_name.clone();
     let lnb = config.list_value_nullable;
     let offsets = || ListOffsets::new(config.use_large_list);
 
-    let inner = match field.kind() {
+    let inner = match &plan.kind {
         Kind::Int32 => RepeatedInner::Int32 {
             values_builder: PrimitiveBuilder::new(),
         },
@@ -2596,47 +2522,42 @@ fn build_repeated_decoder(
         Kind::Bytes => RepeatedInner::Bytes {
             values_builder: BinaryBuilderInner::new(config.use_large_binary),
         },
-        Kind::Enum(enum_desc) => match config.enum_repr {
+        Kind::Enum(_) => match config.enum_repr {
             EnumRepr::Int32 => RepeatedInner::EnumInt32 {
                 values_builder: PrimitiveBuilder::new(),
             },
             EnumRepr::String => RepeatedInner::EnumString {
                 values_builder: StringBuilderInner::new(config.use_large_string),
-                enum_names: EnumNames::new(&enum_desc),
+                enum_names: plan.enum_names(),
             },
             EnumRepr::Binary => RepeatedInner::EnumBinary {
                 values_builder: BinaryBuilderInner::new(config.use_large_binary),
-                enum_names: EnumNames::new(&enum_desc),
+                enum_names: plan.enum_names(),
             },
         },
         Kind::Message(msg_desc) => {
-            return build_repeated_message_decoder(
-                &msg_desc,
-                config,
-                offsets(),
-                ln,
-                lnb,
-                ancestors,
-            );
+            let message = plan.message.as_ref();
+            return build_repeated_message_decoder(msg_desc, message, config, offsets(), ln, lnb);
         }
     };
 
-    Some(FieldDecoder::Repeated {
+    FieldDecoder::Repeated {
         inner: Box::new(inner),
         offsets: offsets(),
         list_name: ln,
         list_nullable: lnb,
-    })
+    }
 }
 
+/// `plan`: as in [`build_message_field_decoder`].
 fn build_repeated_message_decoder(
     msg_desc: &MessageDescriptor,
+    plan: Option<&DecoderPlan>,
     config: &PtarsConfig,
     offsets: ListOffsets,
     ln: Arc<str>,
     lnb: bool,
-    ancestors: &mut Vec<String>,
-) -> Option<FieldDecoder> {
+) -> FieldDecoder {
     let inner = match msg_desc.full_name() {
         "google.protobuf.Timestamp" => RepeatedInner::Timestamp {
             values_builder: PrimitiveBuilder::new(),
@@ -2681,45 +2602,31 @@ fn build_repeated_message_decoder(
         "google.protobuf.BytesValue" => RepeatedInner::WrapperBytes {
             values_builder: BinaryBuilderInner::new(config.use_large_binary),
         },
-        _ => {
-            // Recursion guard (see MessageDecoder::new_inner): a recursive `repeated Foo`
-            // becomes a list of the elements' raw bytes.
-            if ancestors.iter().any(|a| a == msg_desc.full_name()) {
-                RepeatedInner::Bytes {
-                    values_builder: BinaryBuilderInner::new(config.use_large_binary),
-                }
-            } else {
-                let sub_decoder = MessageDecoder::new_inner(msg_desc, config, 0, ancestors);
-                RepeatedInner::Message { sub_decoder }
-            }
-        }
+        _ => match plan {
+            Some(plan) => RepeatedInner::Message {
+                sub_decoder: plan.decoder(0),
+            },
+            None => RepeatedInner::Bytes {
+                values_builder: BinaryBuilderInner::new(config.use_large_binary),
+            },
+        },
     };
 
-    Some(FieldDecoder::Repeated {
+    FieldDecoder::Repeated {
         inner: Box::new(inner),
         offsets,
         list_name: ln,
         list_nullable: lnb,
-    })
+    }
 }
 
-fn build_map_decoder(
-    field: &FieldDescriptor,
-    config: &PtarsConfig,
-    ancestors: &mut Vec<String>,
-) -> Option<FieldDecoder> {
-    let map_entry = match field.kind() {
-        Kind::Message(desc) => desc,
-        _ => return None,
-    };
-    let key_field = map_entry.get_field_by_name("key")?;
-    let value_field = map_entry.get_field_by_name("value")?;
-
+/// `key`, `value`: the plans of the map entry's fields.
+fn build_map_decoder(key: &FieldPlan, value: &FieldPlan, config: &PtarsConfig) -> FieldDecoder {
     // One row per entry; the number of entries is unknown.
-    let (key_decoder, key_flags) = build_field_decoder(&key_field, config, 0, ancestors)?;
-    let (value_decoder, value_flags) = build_field_decoder(&value_field, config, 0, ancestors)?;
+    let (key_decoder, key_flags) = build_field_decoder(key, config, 0);
+    let (value_decoder, value_flags) = build_field_decoder(value, config, 0);
 
-    Some(FieldDecoder::Map {
+    FieldDecoder::Map {
         key_flags,
         value_flags,
         key_decoder: Box::new(key_decoder),
@@ -2728,7 +2635,7 @@ fn build_map_decoder(
         row_entries: 0,
         map_value_name: config.map_value_name.clone(),
         map_value_nullable: config.map_value_nullable,
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------

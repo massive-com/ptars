@@ -8,7 +8,7 @@ use prost::Message;
 use prost_reflect::prost_types::field_descriptor_proto::{Label, Type};
 use prost_reflect::prost_types::{DescriptorProto, FieldDescriptorProto, FileDescriptorProto};
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor, Value};
-use ptars_core::{binary_array_to_record_batch_direct, MessageDecoder, PtarsConfig};
+use ptars_core::{binary_array_to_record_batch_direct, DecoderPlan, MessageDecoder, PtarsConfig};
 
 const BATCH_SIZES: [usize; 4] = [1, 64, 1024, 8192];
 
@@ -193,6 +193,14 @@ fn bench_shape(
                 });
             },
         );
+        let plan = DecoderPlan::new(descriptor, &config);
+        group.bench_with_input(BenchmarkId::new("plan", n), &messages, |b, m| {
+            b.iter(|| {
+                let mut decoder = plan.decoder(n);
+                decode_rows(&mut decoder, m).unwrap();
+                decoder.finish()
+            });
+        });
         group.bench_with_input(BenchmarkId::new("reuse", n), &messages, |b, m| {
             let mut decoder = MessageDecoder::with_capacity(descriptor, &config, n);
             b.iter(|| {
@@ -205,6 +213,9 @@ fn bench_shape(
         });
         group.bench_with_input(BenchmarkId::new("build_finish", n), &n, |b, &n| {
             b.iter(|| MessageDecoder::with_capacity(descriptor, &config, n).finish());
+        });
+        group.bench_with_input(BenchmarkId::new("plan_build_finish", n), &n, |b, &n| {
+            b.iter(|| plan.decoder(n).finish());
         });
     }
     group.finish();
