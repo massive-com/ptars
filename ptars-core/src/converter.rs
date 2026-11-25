@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::arrow_to_proto::record_batch_to_array;
-    use crate::config::PtarsConfig;
+    use crate::config::{EnumRepr, PtarsConfig};
     use crate::proto_to_arrow::{
         binary_array_to_record_batch_direct, messages_to_record_batch,
         messages_to_record_batch_with_config,
@@ -2097,10 +2097,35 @@ mod tests {
         key_type: Type,
         value_type: Type,
     ) -> (DescriptorPool, MessageDescriptor) {
+        create_map_descriptor_with_syntax(key_type, value_type, "proto3")
+    }
+
+    /// `map<key_type, value_type> my_map = 1;`. An `Enum` value is
+    /// `enum E { B = 1; C = 2; }`, whose first value isn't 0.
+    fn create_map_descriptor_with_syntax(
+        key_type: Type,
+        value_type: Type,
+        syntax: &str,
+    ) -> (DescriptorPool, MessageDescriptor) {
+        let enum_value =
+            |name: &str, number| prost_reflect::prost_types::EnumValueDescriptorProto {
+                name: Some(name.to_string()),
+                number: Some(number),
+                ..Default::default()
+            };
         let file_descriptor = FileDescriptorProto {
             name: Some("test.proto".to_string()),
             package: Some("test".to_string()),
-            syntax: Some("proto3".to_string()),
+            syntax: Some(syntax.to_string()),
+            enum_type: if value_type == Type::Enum {
+                vec![prost_reflect::prost_types::EnumDescriptorProto {
+                    name: Some("E".to_string()),
+                    value: vec![enum_value("B", 1), enum_value("C", 2)],
+                    ..Default::default()
+                }]
+            } else {
+                Vec::new()
+            },
             message_type: vec![
                 DescriptorProto {
                     name: Some("MapEntry".to_string()),
@@ -2117,6 +2142,7 @@ mod tests {
                             number: Some(2),
                             label: Some(Label::Optional.into()),
                             r#type: Some(value_type.into()),
+                            type_name: (value_type == Type::Enum).then(|| ".test.E".to_string()),
                             ..Default::default()
                         },
                     ],
@@ -2144,6 +2170,64 @@ mod tests {
         let pool = create_pool_with_message(file_descriptor);
         let message_descriptor = pool.get_message_by_name("test.MessageWithMap").unwrap();
         (pool, message_descriptor)
+    }
+
+    /// In proto2, map entry fields support presence, but a missing key or
+    /// value still decodes to its default, not null. A key repeated within
+    /// one row keeps every entry, in wire order: protobuf parsers keep only
+    /// the last, but Arrow maps allow repeated keys.
+    #[test]
+    fn test_proto2_map_missing_fields_and_repeated_keys() {
+        use arrow::array::{Int32Array, MapArray, StringArray};
+        let (_pool, descriptor) =
+            create_map_descriptor_with_syntax(Type::Int32, Type::String, "proto2");
+        let rows: [&[u8]; 2] = [
+            // `{key: 5}` and `{value: "a"}`.
+            &[0x0A, 0x02, 0x08, 0x05, 0x0A, 0x03, 0x12, 0x01, b'a'],
+            // `{key: 5, value: "a"}` and `{key: 5, value: "b"}`.
+            &[
+                0x0A, 0x05, 0x08, 0x05, 0x12, 0x01, b'a', 0x0A, 0x05, 0x08, 0x05, 0x12, 0x01, b'b',
+            ],
+        ];
+        let batch = decode_raw(&descriptor, &rows, &PtarsConfig::default());
+        let map = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        let keys = map.keys().as_any().downcast_ref::<Int32Array>().unwrap();
+        let values = map.values().as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(map.value_offsets(), &[0, 2, 4]);
+        assert_eq!(keys, &Int32Array::from(vec![5, 0, 5, 5]));
+        assert_eq!(values, &StringArray::from(vec!["", "a", "a", "b"]));
+    }
+
+    /// An absent enum without presence (a proto2 map value) decodes as the
+    /// enum's first value, which in proto2 needn't be 0.
+    #[test]
+    fn test_proto2_map_missing_enum_value_is_first_value() {
+        use crate::config::EnumRepr;
+        use arrow::array::{Int32Array, MapArray, StringArray};
+        let (_pool, descriptor) =
+            create_map_descriptor_with_syntax(Type::String, Type::Enum, "proto2");
+        // One entry, `{key: "k"}`, without a value.
+        let row: &[u8] = &[0x0A, 0x03, 0x0A, 0x01, b'k'];
+        for repr in [EnumRepr::Int32, EnumRepr::String, EnumRepr::Binary] {
+            let config = PtarsConfig::default().with_enum_repr(repr);
+            let batch = decode_raw(&descriptor, &[row], &config);
+            let map = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+            let values = map.values().as_any();
+            match repr {
+                EnumRepr::Int32 => assert_eq!(
+                    values.downcast_ref::<Int32Array>().unwrap(),
+                    &Int32Array::from(vec![1])
+                ),
+                EnumRepr::String => assert_eq!(
+                    values.downcast_ref::<StringArray>().unwrap(),
+                    &StringArray::from(vec!["B"])
+                ),
+                EnumRepr::Binary => assert_eq!(
+                    values.downcast_ref::<BinaryArray>().unwrap(),
+                    &BinaryArray::from(vec![&b"B"[..]])
+                ),
+            }
+        }
     }
 
     #[test]
@@ -2790,6 +2874,65 @@ mod tests {
         })
         .unwrap();
         pool
+    }
+
+    /// A wrapper that occurs again without its `value` keeps the earlier
+    /// value, as when protobuf merges the messages.
+    #[test]
+    fn test_wrappers_keep_value_when_repeated_empty() {
+        let cases = [
+            ("DoubleValue", Value::F64(1.5)),
+            ("FloatValue", Value::F32(1.5)),
+            ("Int64Value", Value::I64(5)),
+            ("UInt64Value", Value::U64(5)),
+            ("Int32Value", Value::I32(5)),
+            ("UInt32Value", Value::U32(5)),
+            ("BoolValue", Value::Bool(true)),
+            ("StringValue", Value::String("abc".to_string())),
+            ("BytesValue", Value::Bytes(b"abc".to_vec().into())),
+        ];
+        for (wrapper, value) in cases {
+            let mut pool = create_wrapper_pool(wrapper);
+            pool.add_file_descriptor_proto(FileDescriptorProto {
+                name: Some("test.proto".to_string()),
+                package: Some("test".to_string()),
+                syntax: Some("proto3".to_string()),
+                dependency: vec!["google/protobuf/wrappers.proto".to_string()],
+                message_type: vec![DescriptorProto {
+                    name: Some("M".to_string()),
+                    field: vec![FieldDescriptorProto {
+                        name: Some("w".to_string()),
+                        number: Some(1),
+                        label: Some(Label::Optional.into()),
+                        r#type: Some(Type::Message.into()),
+                        type_name: Some(format!(".google.protobuf.{wrapper}")),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+            let descriptor = pool.get_message_by_name("test.M").unwrap();
+            let w = descriptor.get_field_by_name("w").unwrap();
+            let Kind::Message(wrapper_descriptor) = w.kind() else {
+                unreachable!()
+            };
+            let message = |inner: DynamicMessage| {
+                let mut message = DynamicMessage::new(descriptor.clone());
+                message.set_field(&w, Value::Message(inner));
+                message
+            };
+            let mut set = DynamicMessage::new(wrapper_descriptor.clone());
+            set.set_field_by_name("value", value);
+            // Field 1 twice: `{value: ...}`, then `{}`.
+            let row = vec![
+                message(set),
+                message(DynamicMessage::new(wrapper_descriptor)),
+            ];
+            assert_eq!(row[1].encode_to_vec(), [0x0A, 0x00], "{wrapper}");
+            assert_concatenation_merges(&descriptor, &[row], &[PtarsConfig::default()]);
+        }
     }
 
     #[test]
@@ -5935,10 +6078,24 @@ mod tests {
             proto3_optional: Some(true),
             ..scalar_field("opt", 18, Type::Int64)
         });
+        fields.push(FieldDescriptorProto {
+            type_name: Some(".test.Color".to_string()),
+            ..scalar_field("color", 19, Type::Enum)
+        });
+        let color = |name: &str, number| prost_reflect::prost_types::EnumValueDescriptorProto {
+            name: Some(name.to_string()),
+            number: Some(number),
+            ..Default::default()
+        };
         let file_descriptor = FileDescriptorProto {
             name: Some("merge.proto".to_string()),
             package: Some("test".to_string()),
             syntax: Some("proto3".to_string()),
+            enum_type: vec![prost_reflect::prost_types::EnumDescriptorProto {
+                name: Some("Color".to_string()),
+                value: vec![color("RED", 0), color("GREEN", 1), color("BLUE", 2)],
+                ..Default::default()
+            }],
             message_type: vec![
                 DescriptorProto {
                     name: Some("Inner".to_string()),
@@ -5993,7 +6150,7 @@ mod tests {
                 Kind::String => Value::String(format!("s{n}")),
                 Kind::Bytes => Value::Bytes(format!("b{n}").into_bytes().into()),
                 Kind::Message(inner) => Value::Message(merge_sample(&inner, seed + 1)),
-                Kind::Enum(_) => unreachable!(),
+                Kind::Enum(_) => Value::EnumNumber((n % 5) as i32),
             };
             message.set_field(&field, value);
         }
@@ -6057,6 +6214,12 @@ mod tests {
             use_large_binary: true,
             ..PtarsConfig::default()
         };
-        assert_concatenation_merges(&descriptor, &rows, &[PtarsConfig::default(), large]);
+        let enum_string = PtarsConfig::default().with_enum_repr(EnumRepr::String);
+        let enum_binary = PtarsConfig::default().with_enum_repr(EnumRepr::Binary);
+        assert_concatenation_merges(
+            &descriptor,
+            &rows,
+            &[PtarsConfig::default(), large, enum_string, enum_binary],
+        );
     }
 }

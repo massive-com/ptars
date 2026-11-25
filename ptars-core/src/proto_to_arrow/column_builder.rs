@@ -4,7 +4,7 @@ use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
 use arrow_array::builder::NullBufferBuilder;
 use arrow_array::{Array, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
 
-use super::decode_error;
+use super::{decode_error, FieldFlags};
 
 /// Validates `data` as UTF-8, checking for ASCII first: for short strings
 /// that is much cheaper than the out-of-line call to `str::from_utf8`.
@@ -30,10 +30,6 @@ pub(super) struct ByteColumn {
 }
 
 impl ByteColumn {
-    pub(super) fn new(large: bool) -> Self {
-        Self::with_capacity(large, 0)
-    }
-
     /// Room for `rows` rows; the value bytes still grow as needed.
     pub(super) fn with_capacity(large: bool, rows: usize) -> Self {
         let mut offsets = Vec::with_capacity(rows + 1);
@@ -44,10 +40,6 @@ impl ByteColumn {
             nulls: NullBufferBuilder::new(rows),
             large,
         }
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.offsets.len() - 1
     }
 
     #[inline(always)]
@@ -63,12 +55,22 @@ impl ByteColumn {
     }
 
     #[inline]
-    pub(super) fn push_or_replace(&mut self, value: &[u8], has_value: &mut bool) {
-        if *has_value {
+    pub(super) fn push_or_replace(&mut self, value: &[u8], flags: &mut FieldFlags) {
+        if flags.contains(FieldFlags::HAS_VALUE) {
             self.replace_cold(value);
         } else {
             self.push(value);
-            *has_value = true;
+            flags.insert(FieldFlags::HAS_VALUE);
+        }
+    }
+
+    /// [`super::push_wrapper`] for a string or bytes wrapper.
+    #[inline(always)]
+    pub(super) fn push_wrapper(&mut self, value: Option<&[u8]>, flags: &mut FieldFlags) {
+        match value {
+            Some(v) => self.push_or_replace(v, flags),
+            None if !flags.contains(FieldFlags::HAS_VALUE) => self.push_or_replace(b"", flags),
+            None => {}
         }
     }
 
@@ -113,16 +115,8 @@ fn narrow_offsets(offsets: Vec<i64>) -> OffsetBuffer<i32> {
 pub(super) struct StringColumn(ByteColumn);
 
 impl StringColumn {
-    pub(super) fn new(large: bool) -> Self {
-        Self(ByteColumn::new(large))
-    }
-
     pub(super) fn with_capacity(large: bool, rows: usize) -> Self {
         Self(ByteColumn::with_capacity(large, rows))
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.0.len()
     }
 
     #[inline]
@@ -135,8 +129,13 @@ impl StringColumn {
     }
 
     #[inline]
-    pub(super) fn push_or_replace(&mut self, value: &str, has_value: &mut bool) {
-        self.0.push_or_replace(value.as_bytes(), has_value);
+    pub(super) fn push_or_replace(&mut self, value: &str, flags: &mut FieldFlags) {
+        self.0.push_or_replace(value.as_bytes(), flags);
+    }
+
+    /// [`super::push_wrapper`] for a string wrapper.
+    pub(super) fn push_wrapper(&mut self, value: Option<&str>, flags: &mut FieldFlags) {
+        self.0.push_wrapper(value.map(str::as_bytes), flags);
     }
 
     /// Builds a string array, large or not as configured.

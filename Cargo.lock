@@ -966,6 +966,7 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-schema",
+ "bitflags",
  "chrono",
  "criterion",
  "prost",

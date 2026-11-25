@@ -260,6 +260,8 @@ fn date_to_days_from_epoch(year: i32, month: i32, day: i32) -> i32 {
 /// protobuf permits — are formatted on the fly, as before.
 struct EnumNames {
     by_number: HashMap<i32, String>,
+    /// The enum's first value, for an absent field without presence.
+    default: i32,
 }
 
 impl EnumNames {
@@ -268,7 +270,15 @@ impl EnumNames {
             .values()
             .map(|v| (v.number(), v.name().to_string()))
             .collect();
-        Self { by_number }
+        Self {
+            by_number,
+            default: descriptor.default_value().number(),
+        }
+    }
+
+    /// The name of the enum's first value, which in proto2 needn't be 0.
+    fn default_name(&self) -> Cow<'_, str> {
+        self.name(self.default)
     }
 
     fn name(&self, number: i32) -> Cow<'_, str> {
@@ -302,12 +312,6 @@ impl StringBuilderInner {
             Self::Large(b) => b.append_value(v),
         }
     }
-    fn append_null(&mut self) {
-        match self {
-            Self::Regular(b) => b.append_null(),
-            Self::Large(b) => b.append_null(),
-        }
-    }
     fn finish(&mut self) -> Arc<dyn Array> {
         match self {
             Self::Regular(b) => Arc::new(b.finish()),
@@ -339,12 +343,6 @@ impl BinaryBuilderInner {
         match self {
             Self::Regular(b) => b.append_value(v),
             Self::Large(b) => b.append_value(v),
-        }
-    }
-    fn append_null(&mut self) {
-        match self {
-            Self::Regular(b) => b.append_null(),
-            Self::Large(b) => b.append_null(),
         }
     }
     fn finish(&mut self) -> Arc<dyn Array> {
@@ -771,12 +769,7 @@ impl RepeatedInner {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                let (v, found) = decode_wrapper_string(data)?;
-                if found {
-                    values_builder.append_value(unsafe { std::str::from_utf8_unchecked(&v) });
-                } else {
-                    values_builder.append_value("");
-                }
+                values_builder.append_value(decode_wrapper_string(data)?.unwrap_or_default());
                 Ok(total)
             }
             Self::WrapperBytes { values_builder, .. } => {
@@ -784,12 +777,7 @@ impl RepeatedInner {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                let (v, found) = decode_wrapper_bytes(data)?;
-                if found {
-                    values_builder.append_value(&v);
-                } else {
-                    values_builder.append_value(b"");
-                }
+                values_builder.append_value(decode_wrapper_bytes(data)?.unwrap_or_default());
                 Ok(total)
             }
         }
@@ -892,111 +880,66 @@ impl RepeatedInner {
 // ---------------------------------------------------------------------------
 
 enum FieldDecoder {
-    // --- Singular scalars (buffered) ---
+    // --- Singular scalars ---
+    // Appended directly in `decode`, except `Bool`, which buffers `value`
+    // until `flush`.
     Int32 {
-        value: i32,
-        has_value: bool,
-        has_presence: bool,
         builder: PrimitiveBuilder<Int32Type>,
     },
     Int64 {
-        value: i64,
-        has_value: bool,
-        has_presence: bool,
         builder: PrimitiveBuilder<Int64Type>,
     },
     UInt32 {
-        value: u32,
-        has_value: bool,
-        has_presence: bool,
         builder: PrimitiveBuilder<UInt32Type>,
     },
     UInt64 {
-        value: u64,
-        has_value: bool,
-        has_presence: bool,
         builder: PrimitiveBuilder<UInt64Type>,
     },
     Sint32 {
-        value: i32,
-        has_value: bool,
-        has_presence: bool,
         builder: PrimitiveBuilder<Int32Type>,
     },
     Sint64 {
-        value: i64,
-        has_value: bool,
-        has_presence: bool,
         builder: PrimitiveBuilder<Int64Type>,
     },
     Sfixed32 {
-        value: i32,
-        has_value: bool,
-        has_presence: bool,
         builder: PrimitiveBuilder<Int32Type>,
     },
     Sfixed64 {
-        value: i64,
-        has_value: bool,
-        has_presence: bool,
         builder: PrimitiveBuilder<Int64Type>,
     },
     Fixed32 {
-        value: u32,
-        has_value: bool,
-        has_presence: bool,
         builder: PrimitiveBuilder<UInt32Type>,
     },
     Fixed64 {
-        value: u64,
-        has_value: bool,
-        has_presence: bool,
         builder: PrimitiveBuilder<UInt64Type>,
     },
     Float {
-        value: f32,
-        has_value: bool,
-        has_presence: bool,
         builder: PrimitiveBuilder<Float32Type>,
     },
     Double {
-        value: f64,
-        has_value: bool,
-        has_presence: bool,
         builder: PrimitiveBuilder<Float64Type>,
     },
     Bool {
         value: bool,
-        has_value: bool,
-        has_presence: bool,
         builder: BooleanBuilder,
     },
     String {
-        has_presence: bool,
         builder: StringColumn,
     },
     Bytes {
-        has_presence: bool,
         builder: ByteColumn,
     },
     EnumInt32 {
-        value: i32,
-        has_value: bool,
-        has_presence: bool,
+        /// The enum's first value, for an absent field without presence.
+        default: i32,
         builder: PrimitiveBuilder<Int32Type>,
     },
     EnumString {
-        value: i32,
-        has_value: bool,
-        has_presence: bool,
-        builder: StringBuilderInner,
+        builder: StringColumn,
         enum_names: EnumNames,
     },
     EnumBinary {
-        value: i32,
-        has_value: bool,
-        has_presence: bool,
-        builder: BinaryBuilderInner,
+        builder: ByteColumn,
         enum_names: EnumNames,
     },
 
@@ -1004,7 +947,6 @@ enum FieldDecoder {
     Timestamp {
         seconds: i64,
         nanos: i32,
-        has_value: bool,
         builder: PrimitiveBuilder<Int64Type>,
         unit: TimeUnit,
         tz: Option<Arc<str>>,
@@ -1012,7 +954,6 @@ enum FieldDecoder {
     Duration {
         seconds: i64,
         nanos: i32,
-        has_value: bool,
         builder: PrimitiveBuilder<Int64Type>,
         unit: TimeUnit,
     },
@@ -1020,7 +961,6 @@ enum FieldDecoder {
         year: i32,
         month: i32,
         day: i32,
-        has_value: bool,
         builder: PrimitiveBuilder<Date32Type>,
     },
     TimeOfDay {
@@ -1028,68 +968,51 @@ enum FieldDecoder {
         minutes: i32,
         seconds_val: i32,
         nanos: i32,
-        has_value: bool,
         builder: PrimitiveBuilder<Int64Type>,
         unit: TimeUnit,
     },
 
     // --- Wrapper types (singular) ---
+    // Appended directly in `decode`, except `WrapperBool`, which buffers
+    // `value` until `flush`.
     WrapperDouble {
-        value: f64,
-        has_value: bool,
         builder: PrimitiveBuilder<Float64Type>,
     },
     WrapperFloat {
-        value: f32,
-        has_value: bool,
         builder: PrimitiveBuilder<Float32Type>,
     },
     WrapperInt64 {
-        value: i64,
-        has_value: bool,
         builder: PrimitiveBuilder<Int64Type>,
     },
     WrapperUInt64 {
-        value: u64,
-        has_value: bool,
         builder: PrimitiveBuilder<UInt64Type>,
     },
     WrapperInt32 {
-        value: i32,
-        has_value: bool,
         builder: PrimitiveBuilder<Int32Type>,
     },
     WrapperUInt32 {
-        value: u32,
-        has_value: bool,
         builder: PrimitiveBuilder<UInt32Type>,
     },
     WrapperBool {
         value: bool,
-        has_value: bool,
         builder: BooleanBuilder,
     },
     WrapperString {
-        value: Vec<u8>,
-        has_value: bool,
-        builder: StringBuilderInner,
+        builder: StringColumn,
     },
     WrapperBytes {
-        value: Vec<u8>,
-        has_value: bool,
-        builder: BinaryBuilderInner,
+        builder: ByteColumn,
     },
 
     // --- Nested message ---
     Message {
-        sub_decoder: MessageDecoder,
-        has_value: bool,
+        sub_decoder: Box<MessageDecoder>,
         is_valid: BooleanBuilder,
     },
 
     // --- Repeated fields (all collapsed into one variant) ---
     Repeated {
-        inner: RepeatedInner,
+        inner: Box<RepeatedInner>,
         offsets: ListOffsets,
         list_name: Arc<str>,
         list_nullable: bool,
@@ -1099,7 +1022,14 @@ enum FieldDecoder {
     Map {
         key_decoder: Box<FieldDecoder>,
         value_decoder: Box<FieldDecoder>,
+        /// What each entry's key and value flags start from. Map keys and
+        /// values have no presence, even in proto2.
+        key_flags: FieldFlags,
+        value_flags: FieldFlags,
         offsets: Vec<i32>,
+        /// Entries decoded in the current row; [`FieldDecoder::flush`] adds
+        /// them to `offsets`.
+        row_entries: i32,
         map_value_name: Arc<str>,
         map_value_nullable: bool,
     },
@@ -1191,45 +1121,42 @@ fn decode_wrapper_fixed64(buf: &[u8]) -> Result<([u8; 8], bool), prost::DecodeEr
     Ok((val, found))
 }
 
-fn decode_wrapper_string(buf: &[u8]) -> Result<(Vec<u8>, bool), prost::DecodeError> {
-    let mut val = Vec::new();
-    let mut found = false;
+/// The last `value` field of a `StringValue` message, if any, borrowed from
+/// `buf` and checked to be UTF-8.
+fn decode_wrapper_string(buf: &[u8]) -> Result<Option<&str>, prost::DecodeError> {
+    let mut val = None;
     let mut pos = 0;
     while pos < buf.len() {
         let (fnum, wt, n) = decode_tag(&buf[pos..])?;
         pos += n;
         if fnum == 1 && wt == 2 {
             let (data, consumed) = read_length_delimited(&buf[pos..])?;
-            validate_utf8(data)?;
-            val.clear();
-            val.extend_from_slice(data);
-            found = true;
+            val = Some(validate_utf8(data)?);
             pos += consumed;
         } else {
             pos += skip_field(wt, &buf[pos..])?;
         }
     }
-    Ok((val, found))
+    Ok(val)
 }
 
-fn decode_wrapper_bytes(buf: &[u8]) -> Result<(Vec<u8>, bool), prost::DecodeError> {
-    let mut val = Vec::new();
-    let mut found = false;
+/// The last `value` field of a `BytesValue` message, if any, borrowed from
+/// `buf`.
+fn decode_wrapper_bytes(buf: &[u8]) -> Result<Option<&[u8]>, prost::DecodeError> {
+    let mut val = None;
     let mut pos = 0;
     while pos < buf.len() {
         let (fnum, wt, n) = decode_tag(&buf[pos..])?;
         pos += n;
         if fnum == 1 && wt == 2 {
             let (data, consumed) = read_length_delimited(&buf[pos..])?;
-            val.clear();
-            val.extend_from_slice(data);
-            found = true;
+            val = Some(data);
             pos += consumed;
         } else {
             pos += skip_field(wt, &buf[pos..])?;
         }
     }
-    Ok((val, found))
+    Ok(val)
 }
 
 // ---------------------------------------------------------------------------
@@ -1237,18 +1164,18 @@ fn decode_wrapper_bytes(buf: &[u8]) -> Result<(Vec<u8>, bool), prost::DecodeErro
 // ---------------------------------------------------------------------------
 
 /// Appends `value`, or replaces the value appended earlier in this row when
-/// the field occurs again (`has_value`).
+/// the field occurs again ([`FieldFlags::HAS_VALUE`]).
 #[inline(always)]
 fn push_or_replace<T: ArrowPrimitiveType>(
     builder: &mut PrimitiveBuilder<T>,
     value: T::Native,
-    has_value: &mut bool,
+    flags: &mut FieldFlags,
 ) {
-    if *has_value {
+    if flags.contains(FieldFlags::HAS_VALUE) {
         *builder.values_slice_mut().last_mut().unwrap() = value;
     } else {
         builder.append_value(value);
-        *has_value = true;
+        flags.insert(FieldFlags::HAS_VALUE);
     }
 }
 
@@ -1256,28 +1183,42 @@ fn push_or_replace<T: ArrowPrimitiveType>(
 fn push_or_replace_with<T: ArrowPrimitiveType, const N: usize>(
     builder: &mut PrimitiveBuilder<T>,
     buf: &[u8],
-    has_value: &mut bool,
+    flags: &mut FieldFlags,
     f: impl FnOnce([u8; N]) -> T::Native,
 ) -> Result<usize, prost::DecodeError> {
     if buf.len() < N {
         return Err(decode_error("unexpected EOF"));
     }
-    push_or_replace(builder, (f)(buf[..N].try_into().unwrap()), has_value);
+    push_or_replace(builder, (f)(buf[..N].try_into().unwrap()), flags);
     Ok(N)
 }
 
-macro_rules! flush_primitive {
-    ($value:expr, $has_value:expr, $has_presence:expr, $builder:expr, $default:expr) => {
-        if *$has_value {
-            $builder.append_value(*$value);
-        } else if *$has_presence {
-            $builder.append_null();
-        } else {
-            $builder.append_value($default);
+/// Appends one occurrence of a wrapper field: its value replaces the row's,
+/// as in [`push_or_replace`]; without one, the row gets the default unless it
+/// already has a value, as when protobuf merges the messages.
+#[inline(always)]
+fn push_wrapper<T: ArrowPrimitiveType>(
+    builder: &mut PrimitiveBuilder<T>,
+    value: Option<T::Native>,
+    flags: &mut FieldFlags,
+) {
+    match value {
+        Some(v) => push_or_replace(builder, v, flags),
+        None if !flags.contains(FieldFlags::HAS_VALUE) => {
+            push_or_replace(builder, T::Native::default(), flags)
         }
-        *$has_value = false;
-        *$value = $default;
-    };
+        None => {}
+    }
+}
+
+/// Ends a row for a directly appended primitive field that was absent from
+/// the message: null where the field has presence, the default otherwise.
+fn append_absent<T: ArrowPrimitiveType>(builder: &mut PrimitiveBuilder<T>, has_presence: bool) {
+    if has_presence {
+        builder.append_null();
+    } else {
+        builder.append_value(T::Native::default());
+    }
 }
 
 fn finish_primitive<T: ArrowPrimitiveType>(builder: &mut PrimitiveBuilder<T>) -> Arc<dyn Array> {
@@ -1355,17 +1296,15 @@ fn finish_time_of_day(builder: &mut PrimitiveBuilder<Int64Type>, unit: TimeUnit)
 // ---------------------------------------------------------------------------
 
 impl FieldDecoder {
-    /// Decodes one occurrence of this field. Singular numbers, enum numbers,
-    /// strings and bytes are appended directly and set `has_value`; a repeat in
-    /// the same row replaces the value. Bools (arrow's `BooleanBuilder` can't
-    /// replace a value), enum names, wrapper and well-known types buffer their
-    /// value until [`Self::flush`] and leave `has_value` alone.
+    /// Decodes one occurrence of this field and sets [`FieldFlags::HAS_VALUE`].
+    /// Unless the field is [`FieldFlags::BUFFERED`], the value is appended
+    /// directly, and a repeat in the same row replaces it.
     #[inline(always)]
     fn decode(
         &mut self,
         wire_type: u8,
         buf: &[u8],
-        has_value: &mut bool,
+        flags: &mut FieldFlags,
     ) -> Result<usize, prost::DecodeError> {
         match self {
             Self::Int32 { builder, .. } | Self::EnumInt32 { builder, .. } => {
@@ -1373,21 +1312,29 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                push_or_replace(builder, v as i32, has_value);
+                push_or_replace(builder, v as i32, flags);
                 Ok(n)
             }
             Self::EnumString {
-                value, has_value, ..
-            }
-            | Self::EnumBinary {
-                value, has_value, ..
+                builder,
+                enum_names,
             } => {
                 if wire_type != 0 {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                *value = v as i32;
-                *has_value = true;
+                builder.push_or_replace(enum_names.name(v as i32).as_ref(), flags);
+                Ok(n)
+            }
+            Self::EnumBinary {
+                builder,
+                enum_names,
+            } => {
+                if wire_type != 0 {
+                    return skip_field(wire_type, buf);
+                }
+                let (v, n) = decode_varint(buf)?;
+                builder.push_or_replace(enum_names.name(v as i32).as_bytes(), flags);
                 Ok(n)
             }
             Self::Int64 { builder, .. } => {
@@ -1395,7 +1342,7 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                push_or_replace(builder, v as i64, has_value);
+                push_or_replace(builder, v as i64, flags);
                 Ok(n)
             }
             Self::UInt32 { builder, .. } => {
@@ -1403,7 +1350,7 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                push_or_replace(builder, v as u32, has_value);
+                push_or_replace(builder, v as u32, flags);
                 Ok(n)
             }
             Self::UInt64 { builder, .. } => {
@@ -1411,7 +1358,7 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                push_or_replace(builder, v, has_value);
+                push_or_replace(builder, v, flags);
                 Ok(n)
             }
             Self::Sint32 { builder, .. } => {
@@ -1419,7 +1366,7 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                push_or_replace(builder, decode_zigzag32(v), has_value);
+                push_or_replace(builder, decode_zigzag32(v), flags);
                 Ok(n)
             }
             Self::Sint64 { builder, .. } => {
@@ -1427,54 +1374,52 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
-                push_or_replace(builder, decode_zigzag64(v), has_value);
+                push_or_replace(builder, decode_zigzag64(v), flags);
                 Ok(n)
             }
             Self::Sfixed32 { builder, .. } => {
                 if wire_type != 5 {
                     return skip_field(wire_type, buf);
                 }
-                push_or_replace_with(builder, buf, has_value, i32::from_le_bytes)
+                push_or_replace_with(builder, buf, flags, i32::from_le_bytes)
             }
             Self::Sfixed64 { builder, .. } => {
                 if wire_type != 1 {
                     return skip_field(wire_type, buf);
                 }
-                push_or_replace_with(builder, buf, has_value, i64::from_le_bytes)
+                push_or_replace_with(builder, buf, flags, i64::from_le_bytes)
             }
             Self::Fixed32 { builder, .. } => {
                 if wire_type != 5 {
                     return skip_field(wire_type, buf);
                 }
-                push_or_replace_with(builder, buf, has_value, u32::from_le_bytes)
+                push_or_replace_with(builder, buf, flags, u32::from_le_bytes)
             }
             Self::Fixed64 { builder, .. } => {
                 if wire_type != 1 {
                     return skip_field(wire_type, buf);
                 }
-                push_or_replace_with(builder, buf, has_value, u64::from_le_bytes)
+                push_or_replace_with(builder, buf, flags, u64::from_le_bytes)
             }
             Self::Float { builder, .. } => {
                 if wire_type != 5 {
                     return skip_field(wire_type, buf);
                 }
-                push_or_replace_with(builder, buf, has_value, f32::from_le_bytes)
+                push_or_replace_with(builder, buf, flags, f32::from_le_bytes)
             }
             Self::Double { builder, .. } => {
                 if wire_type != 1 {
                     return skip_field(wire_type, buf);
                 }
-                push_or_replace_with(builder, buf, has_value, f64::from_le_bytes)
+                push_or_replace_with(builder, buf, flags, f64::from_le_bytes)
             }
-            Self::Bool {
-                value, has_value, ..
-            } => {
+            Self::Bool { value, .. } => {
                 if wire_type != 0 {
                     return skip_field(wire_type, buf);
                 }
                 let (v, n) = decode_varint(buf)?;
                 *value = v != 0;
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(n)
             }
             Self::String { builder, .. } => {
@@ -1482,7 +1427,7 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                builder.push_or_replace(validate_utf8(data)?, has_value);
+                builder.push_or_replace(validate_utf8(data)?, flags);
                 Ok(total)
             }
             Self::Bytes { builder, .. } => {
@@ -1490,16 +1435,11 @@ impl FieldDecoder {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                builder.push_or_replace(data, has_value);
+                builder.push_or_replace(data, flags);
                 Ok(total)
             }
             // Well-known types: decode submessage
-            Self::Timestamp {
-                seconds,
-                nanos,
-                has_value,
-                ..
-            } => {
+            Self::Timestamp { seconds, nanos, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
@@ -1507,15 +1447,10 @@ impl FieldDecoder {
                 let vals = decode_wkt_submessage(data, 2)?;
                 *seconds = vals[0];
                 *nanos = vals[1] as i32;
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(total)
             }
-            Self::Duration {
-                seconds,
-                nanos,
-                has_value,
-                ..
-            } => {
+            Self::Duration { seconds, nanos, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
@@ -1523,15 +1458,11 @@ impl FieldDecoder {
                 let vals = decode_wkt_submessage(data, 2)?;
                 *seconds = vals[0];
                 *nanos = vals[1] as i32;
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(total)
             }
             Self::Date {
-                year,
-                month,
-                day,
-                has_value,
-                ..
+                year, month, day, ..
             } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
@@ -1541,7 +1472,7 @@ impl FieldDecoder {
                 *year = vals[0] as i32;
                 *month = vals[1] as i32;
                 *day = vals[2] as i32;
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(total)
             }
             Self::TimeOfDay {
@@ -1549,7 +1480,6 @@ impl FieldDecoder {
                 minutes,
                 seconds_val,
                 nanos,
-                has_value,
                 ..
             } => {
                 if wire_type != 2 {
@@ -1561,130 +1491,94 @@ impl FieldDecoder {
                 *minutes = vals[1] as i32;
                 *seconds_val = vals[2] as i32;
                 *nanos = vals[3] as i32;
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(total)
             }
             // Wrapper types
-            Self::WrapperDouble {
-                value, has_value, ..
-            } => {
+            Self::WrapperDouble { builder } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
                 let (bytes, found) = decode_wrapper_fixed64(data)?;
-                if found {
-                    *value = f64::from_le_bytes(bytes);
-                }
-                *has_value = true;
+                push_wrapper(builder, found.then(|| f64::from_le_bytes(bytes)), flags);
                 Ok(total)
             }
-            Self::WrapperFloat {
-                value, has_value, ..
-            } => {
+            Self::WrapperFloat { builder } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
                 let (bytes, found) = decode_wrapper_fixed32(data)?;
+                push_wrapper(builder, found.then(|| f32::from_le_bytes(bytes)), flags);
+                Ok(total)
+            }
+            Self::WrapperInt64 { builder } => {
+                if wire_type != 2 {
+                    return skip_field(wire_type, buf);
+                }
+                let (data, total) = read_length_delimited(buf)?;
+                let (v, found) = decode_wrapper_varint(data)?;
+                push_wrapper(builder, found.then_some(v as i64), flags);
+                Ok(total)
+            }
+            Self::WrapperUInt64 { builder } => {
+                if wire_type != 2 {
+                    return skip_field(wire_type, buf);
+                }
+                let (data, total) = read_length_delimited(buf)?;
+                let (v, found) = decode_wrapper_varint(data)?;
+                push_wrapper(builder, found.then_some(v), flags);
+                Ok(total)
+            }
+            Self::WrapperInt32 { builder } => {
+                if wire_type != 2 {
+                    return skip_field(wire_type, buf);
+                }
+                let (data, total) = read_length_delimited(buf)?;
+                let (v, found) = decode_wrapper_varint(data)?;
+                push_wrapper(builder, found.then_some(v as i32), flags);
+                Ok(total)
+            }
+            Self::WrapperUInt32 { builder } => {
+                if wire_type != 2 {
+                    return skip_field(wire_type, buf);
+                }
+                let (data, total) = read_length_delimited(buf)?;
+                let (v, found) = decode_wrapper_varint(data)?;
+                push_wrapper(builder, found.then_some(v as u32), flags);
+                Ok(total)
+            }
+            Self::WrapperBool { value, .. } => {
+                if wire_type != 2 {
+                    return skip_field(wire_type, buf);
+                }
+                let (data, total) = read_length_delimited(buf)?;
+                let (v, found) = decode_wrapper_varint(data)?;
                 if found {
-                    *value = f32::from_le_bytes(bytes);
+                    *value = v != 0;
                 }
-                *has_value = true;
+                flags.insert(FieldFlags::HAS_VALUE);
                 Ok(total)
             }
-            Self::WrapperInt64 {
-                value, has_value, ..
-            } => {
+            Self::WrapperString { builder } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                let (v, _) = decode_wrapper_varint(data)?;
-                *value = v as i64;
-                *has_value = true;
+                builder.push_wrapper(decode_wrapper_string(data)?, flags);
                 Ok(total)
             }
-            Self::WrapperUInt64 {
-                value, has_value, ..
-            } => {
+            Self::WrapperBytes { builder } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
                 let (data, total) = read_length_delimited(buf)?;
-                let (v, _) = decode_wrapper_varint(data)?;
-                *value = v;
-                *has_value = true;
-                Ok(total)
-            }
-            Self::WrapperInt32 {
-                value, has_value, ..
-            } => {
-                if wire_type != 2 {
-                    return skip_field(wire_type, buf);
-                }
-                let (data, total) = read_length_delimited(buf)?;
-                let (v, _) = decode_wrapper_varint(data)?;
-                *value = v as i32;
-                *has_value = true;
-                Ok(total)
-            }
-            Self::WrapperUInt32 {
-                value, has_value, ..
-            } => {
-                if wire_type != 2 {
-                    return skip_field(wire_type, buf);
-                }
-                let (data, total) = read_length_delimited(buf)?;
-                let (v, _) = decode_wrapper_varint(data)?;
-                *value = v as u32;
-                *has_value = true;
-                Ok(total)
-            }
-            Self::WrapperBool {
-                value, has_value, ..
-            } => {
-                if wire_type != 2 {
-                    return skip_field(wire_type, buf);
-                }
-                let (data, total) = read_length_delimited(buf)?;
-                let (v, _) = decode_wrapper_varint(data)?;
-                *value = v != 0;
-                *has_value = true;
-                Ok(total)
-            }
-            Self::WrapperString {
-                value, has_value, ..
-            } => {
-                if wire_type != 2 {
-                    return skip_field(wire_type, buf);
-                }
-                let (data, total) = read_length_delimited(buf)?;
-                let (v, _) = decode_wrapper_string(data)?;
-                value.clear();
-                value.extend_from_slice(&v);
-                *has_value = true;
-                Ok(total)
-            }
-            Self::WrapperBytes {
-                value, has_value, ..
-            } => {
-                if wire_type != 2 {
-                    return skip_field(wire_type, buf);
-                }
-                let (data, total) = read_length_delimited(buf)?;
-                let (v, _) = decode_wrapper_bytes(data)?;
-                value.clear();
-                value.extend_from_slice(&v);
-                *has_value = true;
+                builder.push_wrapper(decode_wrapper_bytes(data)?, flags);
                 Ok(total)
             }
             // Nested message
-            Self::Message {
-                sub_decoder,
-                has_value,
-                ..
-            } => {
+            Self::Message { sub_decoder, .. } => {
                 if wire_type != 2 {
                     return skip_field(wire_type, buf);
                 }
@@ -1692,9 +1586,7 @@ impl FieldDecoder {
                 // For singular messages, if seen multiple times, the spec says merge.
                 // For simplicity (and matching DynamicMessage behavior), we decode fresh each time.
                 // Reset sub_decoder if already decoded this row.
-                if !*has_value {
-                    *has_value = true;
-                }
+                flags.insert(FieldFlags::HAS_VALUE);
                 sub_decoder.decode_message_bytes(data)?;
                 Ok(total)
             }
@@ -1704,19 +1596,35 @@ impl FieldDecoder {
             Self::Map {
                 key_decoder,
                 value_decoder,
+                key_flags,
+                value_flags,
+                row_entries,
                 ..
-            } => Self::decode_map_entry(wire_type, buf, key_decoder, value_decoder),
+            } => Self::decode_map_entry(
+                wire_type,
+                buf,
+                key_decoder,
+                value_decoder,
+                *key_flags,
+                *value_flags,
+                row_entries,
+            ),
         }
     }
 
     /// Decodes one entry of a map field. Out of line, since it decodes the
-    /// key and the value with [`Self::decode`].
+    /// key and the value with [`Self::decode`]. A key repeated in one row
+    /// keeps every entry: protobuf keeps only the last, but builders can't
+    /// drop an earlier entry.
     #[inline(never)]
     fn decode_map_entry(
         wire_type: u8,
         buf: &[u8],
         key_decoder: &mut FieldDecoder,
         value_decoder: &mut FieldDecoder,
+        key_start: FieldFlags,
+        value_start: FieldFlags,
+        row_entries: &mut i32,
     ) -> Result<usize, prost::DecodeError> {
         if wire_type != 2 {
             return skip_field(wire_type, buf);
@@ -1724,208 +1632,97 @@ impl FieldDecoder {
         let (data, total) = read_length_delimited(buf)?;
         // Parse entry submessage: field 1 = key, field 2 = value
         let mut pos = 0;
-        let (mut key_seen, mut value_seen) = (false, false);
+        let (mut key_flags, mut value_flags) = (key_start, value_start);
         while pos < data.len() {
             let (fnum, wt, n) = decode_tag(&data[pos..])?;
             pos += n;
             if fnum == 1 {
-                pos += key_decoder.decode(wt, &data[pos..], &mut key_seen)?;
+                pos += key_decoder.decode(wt, &data[pos..], &mut key_flags)?;
             } else if fnum == 2 {
-                pos += value_decoder.decode(wt, &data[pos..], &mut value_seen)?;
+                pos += value_decoder.decode(wt, &data[pos..], &mut value_flags)?;
             } else {
                 pos += skip_field(wt, &data[pos..])?;
             }
         }
-        if !key_seen {
-            key_decoder.flush();
+        if key_flags.needs_flush() {
+            key_decoder.flush(key_flags);
         }
-        if !value_seen {
-            value_decoder.flush();
+        if value_flags.needs_flush() {
+            value_decoder.flush(value_flags);
         }
+        *row_entries += 1;
         Ok(total)
     }
 
-    /// Number of values this singular decoder has appended to its builder. Used by the
-    /// map decoder to compute entry offsets from its key decoder; covers exactly the
-    /// kinds protobuf allows as map keys (integers, bool, string), `None` otherwise.
-    fn appended_len(&self) -> Option<usize> {
-        Some(match self {
-            Self::Int32 { builder, .. }
-            | Self::Sint32 { builder, .. }
-            | Self::Sfixed32 { builder, .. } => ArrayBuilder::len(builder),
-            Self::Int64 { builder, .. }
-            | Self::Sint64 { builder, .. }
-            | Self::Sfixed64 { builder, .. } => ArrayBuilder::len(builder),
-            Self::UInt32 { builder, .. } | Self::Fixed32 { builder, .. } => {
-                ArrayBuilder::len(builder)
-            }
-            Self::UInt64 { builder, .. } | Self::Fixed64 { builder, .. } => {
-                ArrayBuilder::len(builder)
-            }
-            Self::Bool { builder, .. } => ArrayBuilder::len(builder),
-            Self::String { builder, .. } => builder.len(),
-            _ => return None,
-        })
-    }
-
-    fn flush(&mut self) {
+    /// Ends a row for this field. [`FieldFlags::HAS_VALUE`]: the field
+    /// occurred in the row; otherwise its value is null with
+    /// [`FieldFlags::HAS_PRESENCE`], the default without.
+    fn flush(&mut self, flags: FieldFlags) {
+        let has_value = flags.contains(FieldFlags::HAS_VALUE);
+        let has_presence = flags.contains(FieldFlags::HAS_PRESENCE);
         match self {
-            Self::Int32 {
-                value,
-                has_value,
-                has_presence,
-                builder,
+            // Appended in decode; flushed only when absent from the row.
+            Self::Int32 { builder } | Self::Sint32 { builder } | Self::Sfixed32 { builder } => {
+                append_absent(builder, has_presence)
             }
-            | Self::Sint32 {
-                value,
-                has_value,
-                has_presence,
-                builder,
+            Self::EnumInt32 { default, builder } => {
+                if has_presence {
+                    builder.append_null();
+                } else {
+                    builder.append_value(*default);
+                }
             }
-            | Self::Sfixed32 {
-                value,
-                has_value,
-                has_presence,
-                builder,
+            Self::Int64 { builder } | Self::Sint64 { builder } | Self::Sfixed64 { builder } => {
+                append_absent(builder, has_presence)
             }
-            | Self::EnumInt32 {
-                value,
-                has_value,
-                has_presence,
-                builder,
-            } => {
-                flush_primitive!(value, has_value, has_presence, builder, 0i32);
+            Self::UInt32 { builder } | Self::Fixed32 { builder } => {
+                append_absent(builder, has_presence)
             }
-            Self::Int64 {
-                value,
-                has_value,
-                has_presence,
-                builder,
+            Self::UInt64 { builder } | Self::Fixed64 { builder } => {
+                append_absent(builder, has_presence)
             }
-            | Self::Sint64 {
-                value,
-                has_value,
-                has_presence,
-                builder,
-            }
-            | Self::Sfixed64 {
-                value,
-                has_value,
-                has_presence,
-                builder,
-            } => {
-                flush_primitive!(value, has_value, has_presence, builder, 0i64);
-            }
-            Self::UInt32 {
-                value,
-                has_value,
-                has_presence,
-                builder,
-            }
-            | Self::Fixed32 {
-                value,
-                has_value,
-                has_presence,
-                builder,
-            } => {
-                flush_primitive!(value, has_value, has_presence, builder, 0u32);
-            }
-            Self::UInt64 {
-                value,
-                has_value,
-                has_presence,
-                builder,
-            }
-            | Self::Fixed64 {
-                value,
-                has_value,
-                has_presence,
-                builder,
-            } => {
-                flush_primitive!(value, has_value, has_presence, builder, 0u64);
-            }
-            Self::Float {
-                value,
-                has_value,
-                has_presence,
-                builder,
-            } => {
-                flush_primitive!(value, has_value, has_presence, builder, 0.0f32);
-            }
-            Self::Double {
-                value,
-                has_value,
-                has_presence,
-                builder,
-            } => {
-                flush_primitive!(value, has_value, has_presence, builder, 0.0f64);
-            }
+            Self::Float { builder } => append_absent(builder, has_presence),
+            Self::Double { builder } => append_absent(builder, has_presence),
             Self::EnumString {
-                value,
-                has_value,
-                has_presence,
                 builder,
                 enum_names,
             } => {
-                if *has_value {
-                    builder.append_value(enum_names.name(*value).as_ref());
-                } else if *has_presence {
-                    builder.append_null();
+                if has_presence {
+                    builder.push_null();
                 } else {
-                    builder.append_value(enum_names.name(0).as_ref());
+                    builder.push(enum_names.default_name().as_ref());
                 }
-                *has_value = false;
-                *value = 0;
             }
             Self::EnumBinary {
-                value,
-                has_value,
-                has_presence,
                 builder,
                 enum_names,
             } => {
-                if *has_value {
-                    builder.append_value(enum_names.name(*value).as_bytes());
-                } else if *has_presence {
-                    builder.append_null();
+                if has_presence {
+                    builder.push_null();
                 } else {
-                    builder.append_value(enum_names.name(0).as_bytes());
+                    builder.push(enum_names.default_name().as_bytes());
                 }
-                *has_value = false;
-                *value = 0;
             }
-            Self::Bool {
-                value,
-                has_value,
-                has_presence,
-                builder,
-            } => {
-                if *has_value {
+            Self::Bool { value, builder } => {
+                if has_value {
                     builder.append_value(*value);
-                } else if *has_presence {
+                } else if has_presence {
                     builder.append_null();
                 } else {
                     builder.append_value(false);
                 }
-                *has_value = false;
                 *value = false;
             }
             // Appended in decode; flushed only when absent from the row.
-            Self::String {
-                has_presence,
-                builder,
-            } => {
-                if *has_presence {
+            Self::String { builder } => {
+                if has_presence {
                     builder.push_null();
                 } else {
                     builder.push("");
                 }
             }
-            Self::Bytes {
-                has_presence,
-                builder,
-            } => {
-                if *has_presence {
+            Self::Bytes { builder } => {
+                if has_presence {
                     builder.push_null();
                 } else {
                     builder.push(b"");
@@ -1935,34 +1732,30 @@ impl FieldDecoder {
             Self::Timestamp {
                 seconds,
                 nanos,
-                has_value,
                 builder,
                 unit,
                 ..
             } => {
-                if *has_value {
+                if has_value {
                     builder.append_value(convert_seconds_nanos_to_unit(*seconds, *nanos, *unit));
                 } else {
                     builder.append_null();
                 }
-                *has_value = false;
                 *seconds = 0;
                 *nanos = 0;
             }
             Self::Duration {
                 seconds,
                 nanos,
-                has_value,
                 builder,
                 unit,
                 ..
             } => {
-                if *has_value {
+                if has_value {
                     builder.append_value(convert_seconds_nanos_to_unit(*seconds, *nanos, *unit));
                 } else {
                     builder.append_null();
                 }
-                *has_value = false;
                 *seconds = 0;
                 *nanos = 0;
             }
@@ -1970,10 +1763,9 @@ impl FieldDecoder {
                 year,
                 month,
                 day,
-                has_value,
                 builder,
             } => {
-                if *has_value {
+                if has_value {
                     if *year == 0 && *month == 0 && *day == 0 {
                         builder.append_value(0);
                     } else {
@@ -1982,7 +1774,6 @@ impl FieldDecoder {
                 } else {
                     builder.append_null();
                 }
-                *has_value = false;
                 *year = 0;
                 *month = 0;
                 *day = 0;
@@ -1992,11 +1783,10 @@ impl FieldDecoder {
                 minutes,
                 seconds_val,
                 nanos,
-                has_value,
                 builder,
                 unit,
             } => {
-                if *has_value {
+                if has_value {
                     let total_seconds = i64::from(*hours) * 3600
                         + i64::from(*minutes) * 60
                         + i64::from(*seconds_val);
@@ -2008,162 +1798,49 @@ impl FieldDecoder {
                 } else {
                     builder.append_null();
                 }
-                *has_value = false;
                 *hours = 0;
                 *minutes = 0;
                 *seconds_val = 0;
                 *nanos = 0;
             }
-            // Wrapper types: present → value, absent → null
-            Self::WrapperDouble {
-                value,
-                has_value,
-                builder,
-            } => {
-                if *has_value {
+            // Wrapper types: appended in decode, flushed only when absent,
+            // except `WrapperBool`.
+            Self::WrapperDouble { builder } => builder.append_null(),
+            Self::WrapperFloat { builder } => builder.append_null(),
+            Self::WrapperInt64 { builder } => builder.append_null(),
+            Self::WrapperUInt64 { builder } => builder.append_null(),
+            Self::WrapperInt32 { builder } => builder.append_null(),
+            Self::WrapperUInt32 { builder } => builder.append_null(),
+            Self::WrapperBool { value, builder } => {
+                if has_value {
                     builder.append_value(*value);
                 } else {
                     builder.append_null();
                 }
-                *has_value = false;
-                *value = 0.0;
-            }
-            Self::WrapperFloat {
-                value,
-                has_value,
-                builder,
-            } => {
-                if *has_value {
-                    builder.append_value(*value);
-                } else {
-                    builder.append_null();
-                }
-                *has_value = false;
-                *value = 0.0;
-            }
-            Self::WrapperInt64 {
-                value,
-                has_value,
-                builder,
-            } => {
-                if *has_value {
-                    builder.append_value(*value);
-                } else {
-                    builder.append_null();
-                }
-                *has_value = false;
-                *value = 0;
-            }
-            Self::WrapperUInt64 {
-                value,
-                has_value,
-                builder,
-            } => {
-                if *has_value {
-                    builder.append_value(*value);
-                } else {
-                    builder.append_null();
-                }
-                *has_value = false;
-                *value = 0;
-            }
-            Self::WrapperInt32 {
-                value,
-                has_value,
-                builder,
-            } => {
-                if *has_value {
-                    builder.append_value(*value);
-                } else {
-                    builder.append_null();
-                }
-                *has_value = false;
-                *value = 0;
-            }
-            Self::WrapperUInt32 {
-                value,
-                has_value,
-                builder,
-            } => {
-                if *has_value {
-                    builder.append_value(*value);
-                } else {
-                    builder.append_null();
-                }
-                *has_value = false;
-                *value = 0;
-            }
-            Self::WrapperBool {
-                value,
-                has_value,
-                builder,
-            } => {
-                if *has_value {
-                    builder.append_value(*value);
-                } else {
-                    builder.append_null();
-                }
-                *has_value = false;
                 *value = false;
             }
-            Self::WrapperString {
-                value,
-                has_value,
-                builder,
-            } => {
-                if *has_value {
-                    builder.append_value(unsafe { std::str::from_utf8_unchecked(value) });
-                } else {
-                    builder.append_null();
-                }
-                *has_value = false;
-                value.clear();
-            }
-            Self::WrapperBytes {
-                value,
-                has_value,
-                builder,
-            } => {
-                if *has_value {
-                    builder.append_value(value.as_slice());
-                } else {
-                    builder.append_null();
-                }
-                *has_value = false;
-                value.clear();
-            }
+            Self::WrapperString { builder } => builder.push_null(),
+            Self::WrapperBytes { builder } => builder.push_null(),
             // Nested message
             Self::Message {
                 sub_decoder,
-                has_value,
                 is_valid,
             } => {
-                if *has_value {
-                    is_valid.append_value(true);
-                    sub_decoder.flush_row();
-                } else {
-                    is_valid.append_value(false);
-                    sub_decoder.flush_defaults();
-                }
-                *has_value = false;
+                // Absent: every field of the struct gets its default.
+                is_valid.append_value(has_value);
+                sub_decoder.flush_row();
             }
             // Repeated fields: push offset
             Self::Repeated { inner, offsets, .. } => {
                 offsets.push(inner.len());
             }
-            // Map: push offset based on key builder length
             Self::Map {
-                key_decoder,
                 offsets,
+                row_entries,
                 ..
             } => {
-                // Every key kind protobuf allows must be covered here: a kind that falls
-                // through leaves the offsets where they were and silently drops every
-                // entry of the map (fixed32/fixed64/sfixed32/sfixed64 keys used to).
-                let count = key_decoder
-                    .appended_len()
-                    .unwrap_or(*offsets.last().unwrap() as usize);
-                offsets.push(count as i32);
+                let end = offsets.last().unwrap() + std::mem::take(row_entries);
+                offsets.push(end);
             }
         }
     }
@@ -2232,35 +1909,51 @@ impl FieldDecoder {
                 offsets,
                 map_value_name,
                 map_value_nullable,
-            } => {
-                let key_array = key_decoder.finish();
-                let value_array = value_decoder.finish();
-                let key_field = Arc::new(Field::new("key", key_array.data_type().clone(), false));
-                let value_field = Arc::new(Field::new(
-                    &**map_value_name,
-                    value_array.data_type().clone(),
-                    *map_value_nullable,
-                ));
-                let entries_struct_type = DataType::Struct(
-                    vec![key_field.as_ref().clone(), value_field.as_ref().clone()].into(),
-                );
-                let entry_struct =
-                    StructArray::from(vec![(key_field, key_array), (value_field, value_array)]);
-                let map_dt = DataType::Map(
-                    Arc::new(Field::new("entries", entries_struct_type, false)),
-                    false,
-                );
-                let len = offsets.len() - 1;
-                let offsets_buf = Buffer::from_vec(std::mem::take(offsets));
-                let map_data = ArrayData::builder(map_dt)
-                    .len(len)
-                    .add_buffer(offsets_buf)
-                    .add_child_data(entry_struct.into_data())
-                    .build()
-                    .unwrap();
-                Arc::new(MapArray::from(map_data))
-            }
+                ..
+            } => Self::finish_map(
+                key_decoder,
+                value_decoder,
+                offsets,
+                map_value_name,
+                *map_value_nullable,
+            ),
         }
+    }
+
+    /// The map column for [`Self::finish`]. Its own function, like
+    /// [`Self::decode_map_entry`], since it finishes the key and the value.
+    fn finish_map(
+        key_decoder: &mut FieldDecoder,
+        value_decoder: &mut FieldDecoder,
+        offsets: &mut Vec<i32>,
+        map_value_name: &str,
+        map_value_nullable: bool,
+    ) -> Arc<dyn Array> {
+        let key_array = key_decoder.finish();
+        let value_array = value_decoder.finish();
+        let key_field = Arc::new(Field::new("key", key_array.data_type().clone(), false));
+        let value_field = Arc::new(Field::new(
+            map_value_name,
+            value_array.data_type().clone(),
+            map_value_nullable,
+        ));
+        let entries_struct_type =
+            DataType::Struct(vec![key_field.as_ref().clone(), value_field.as_ref().clone()].into());
+        let entry_struct =
+            StructArray::from(vec![(key_field, key_array), (value_field, value_array)]);
+        let map_dt = DataType::Map(
+            Arc::new(Field::new("entries", entries_struct_type, false)),
+            false,
+        );
+        let len = offsets.len() - 1;
+        let offsets_buf = Buffer::from_vec(std::mem::take(offsets));
+        let map_data = ArrayData::builder(map_dt)
+            .len(len)
+            .add_buffer(offsets_buf)
+            .add_child_data(entry_struct.into_data())
+            .build()
+            .unwrap();
+        Arc::new(MapArray::from(map_data))
     }
 }
 
@@ -2372,13 +2065,32 @@ fn decode_repeated_wrapper_fixed64<T: ArrowPrimitiveType>(
 // MessageDecoder
 // ---------------------------------------------------------------------------
 
+bitflags::bitflags! {
+    /// Per-field flags of a [`MessageDecoder`].
+    #[derive(Clone, Copy)]
+    struct FieldFlags: u8 {
+        /// The field occurred in the current row (see [`FieldDecoder::decode`]).
+        const HAS_VALUE = 1;
+        /// [`FieldDescriptor::supports_presence`]: an absent value is null.
+        const HAS_PRESENCE = 1 << 1;
+        /// [`FieldDecoder::flush`] runs at the end of every row, not only
+        /// when the field is absent. Set by [`build_field_decoder`].
+        const BUFFERED = 1 << 2;
+    }
+}
+
+impl FieldFlags {
+    /// The end of a row must flush the field: it is absent, or buffered.
+    fn needs_flush(self) -> bool {
+        !self.contains(Self::HAS_VALUE) || self.contains(Self::BUFFERED)
+    }
+}
+
 /// One field of a [`MessageDecoder`].
 struct DecoderState {
     decoder: FieldDecoder,
     field: FieldDescriptor,
-    /// The decoder appended its value directly in the current row (see
-    /// [`FieldDecoder::decode`]).
-    has_value: bool,
+    flags: FieldFlags,
 }
 
 pub struct MessageDecoder {
@@ -2422,14 +2134,17 @@ impl MessageDecoder {
         let mut max_field_number: u32 = 0;
 
         for field in descriptor.fields() {
-            if let Some(decoder) = build_field_decoder(&field, config, capacity, ancestors) {
+            if let Some((decoder, mut flags)) =
+                build_field_decoder(&field, config, capacity, ancestors)
+            {
                 if field.number() > max_field_number {
                     max_field_number = field.number();
                 }
+                flags.set(FieldFlags::HAS_PRESENCE, field.supports_presence());
                 decoders.push(DecoderState {
                     decoder,
                     field,
-                    has_value: false,
+                    flags,
                 });
             }
         }
@@ -2468,15 +2183,13 @@ impl MessageDecoder {
                 None
             };
             if let Some(idx) = idx {
-                let DecoderState {
-                    decoder, has_value, ..
-                } = &mut self.decoders[idx];
-                pos += decoder.decode(wire_type, &buf[pos..], has_value)?;
+                let DecoderState { decoder, flags, .. } = &mut self.decoders[idx];
+                pos += decoder.decode(wire_type, &buf[pos..], flags)?;
             } else {
                 pos += skip_field(wire_type, &buf[pos..])?;
             }
         }
-        self.flush_unseen();
+        self.flush_row();
         self.num_rows += 1;
         Ok(())
     }
@@ -2494,10 +2207,8 @@ impl MessageDecoder {
                 None
             };
             if let Some(idx) = idx {
-                let DecoderState {
-                    decoder, has_value, ..
-                } = &mut self.decoders[idx];
-                pos += decoder.decode(wire_type, &buf[pos..], has_value)?;
+                let DecoderState { decoder, flags, .. } = &mut self.decoders[idx];
+                pos += decoder.decode(wire_type, &buf[pos..], flags)?;
             } else {
                 pos += skip_field(wire_type, &buf[pos..])?;
             }
@@ -2506,29 +2217,19 @@ impl MessageDecoder {
     }
 
     /// Ends a row: flushes every decoder that did not append its value
-    /// directly (see [`FieldDecoder::decode`]) and clears `has_value`.
-    fn flush_unseen(&mut self) {
-        for DecoderState {
-            decoder, has_value, ..
-        } in &mut self.decoders
-        {
-            if !*has_value {
-                decoder.flush();
+    /// directly (see [`FieldDecoder::decode`]) and clears
+    /// [`FieldFlags::HAS_VALUE`].
+    fn flush_row(&mut self) {
+        for DecoderState { decoder, flags, .. } in &mut self.decoders {
+            if flags.needs_flush() {
+                decoder.flush(*flags);
             }
-            *has_value = false;
+            flags.remove(FieldFlags::HAS_VALUE);
         }
     }
 
-    fn flush_row(&mut self) {
-        self.flush_unseen();
-    }
-
-    fn flush_defaults(&mut self) {
-        self.flush_unseen(); // all absent → defaults
-    }
-
     fn decode_null_row(&mut self) {
-        self.flush_unseen();
+        self.flush_row();
         self.num_rows += 1;
     }
 
@@ -2594,127 +2295,87 @@ impl MessageDecoder {
 // build_field_decoder
 // ---------------------------------------------------------------------------
 
-/// `capacity`: rows to size scalar builders for (0 when unknown).
+/// The decoder for `field`, with [`FieldFlags::BUFFERED`] set where it
+/// needs it. `capacity`: rows to size scalar builders for (0 when unknown).
 fn build_field_decoder(
     field: &FieldDescriptor,
     config: &PtarsConfig,
     capacity: usize,
     ancestors: &mut Vec<String>,
-) -> Option<FieldDecoder> {
+) -> Option<(FieldDecoder, FieldFlags)> {
     if field.is_map() {
-        return build_map_decoder(field, config, ancestors);
+        return Some((
+            build_map_decoder(field, config, ancestors)?,
+            FieldFlags::BUFFERED,
+        ));
     }
     if field.is_list() {
-        return build_repeated_decoder(field, config, ancestors);
+        return Some((
+            build_repeated_decoder(field, config, ancestors)?,
+            FieldFlags::BUFFERED,
+        ));
     }
 
-    let has_presence = field.supports_presence();
+    let direct = |decoder| Some((decoder, FieldFlags::empty()));
+    let buffered = |decoder| Some((decoder, FieldFlags::BUFFERED));
     match field.kind() {
-        Kind::Int32 => Some(FieldDecoder::Int32 {
-            value: 0,
-            has_value: false,
-            has_presence,
+        Kind::Int32 => direct(FieldDecoder::Int32 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Int64 => Some(FieldDecoder::Int64 {
-            value: 0,
-            has_value: false,
-            has_presence,
+        Kind::Int64 => direct(FieldDecoder::Int64 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Uint32 => Some(FieldDecoder::UInt32 {
-            value: 0,
-            has_value: false,
-            has_presence,
+        Kind::Uint32 => direct(FieldDecoder::UInt32 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Uint64 => Some(FieldDecoder::UInt64 {
-            value: 0,
-            has_value: false,
-            has_presence,
+        Kind::Uint64 => direct(FieldDecoder::UInt64 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Sint32 => Some(FieldDecoder::Sint32 {
-            value: 0,
-            has_value: false,
-            has_presence,
+        Kind::Sint32 => direct(FieldDecoder::Sint32 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Sint64 => Some(FieldDecoder::Sint64 {
-            value: 0,
-            has_value: false,
-            has_presence,
+        Kind::Sint64 => direct(FieldDecoder::Sint64 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Sfixed32 => Some(FieldDecoder::Sfixed32 {
-            value: 0,
-            has_value: false,
-            has_presence,
+        Kind::Sfixed32 => direct(FieldDecoder::Sfixed32 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Sfixed64 => Some(FieldDecoder::Sfixed64 {
-            value: 0,
-            has_value: false,
-            has_presence,
+        Kind::Sfixed64 => direct(FieldDecoder::Sfixed64 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Fixed32 => Some(FieldDecoder::Fixed32 {
-            value: 0,
-            has_value: false,
-            has_presence,
+        Kind::Fixed32 => direct(FieldDecoder::Fixed32 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Fixed64 => Some(FieldDecoder::Fixed64 {
-            value: 0,
-            has_value: false,
-            has_presence,
+        Kind::Fixed64 => direct(FieldDecoder::Fixed64 {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Float => Some(FieldDecoder::Float {
-            value: 0.0,
-            has_value: false,
-            has_presence,
+        Kind::Float => direct(FieldDecoder::Float {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Double => Some(FieldDecoder::Double {
-            value: 0.0,
-            has_value: false,
-            has_presence,
+        Kind::Double => direct(FieldDecoder::Double {
             builder: PrimitiveBuilder::with_capacity(capacity),
         }),
-        Kind::Bool => Some(FieldDecoder::Bool {
+        Kind::Bool => buffered(FieldDecoder::Bool {
             value: false,
-            has_value: false,
-            has_presence,
             builder: BooleanBuilder::with_capacity(capacity),
         }),
-        Kind::String => Some(FieldDecoder::String {
-            has_presence,
+        Kind::String => direct(FieldDecoder::String {
             builder: StringColumn::with_capacity(config.use_large_string, capacity),
         }),
-        Kind::Bytes => Some(FieldDecoder::Bytes {
-            has_presence,
+        Kind::Bytes => direct(FieldDecoder::Bytes {
             builder: ByteColumn::with_capacity(config.use_large_binary, capacity),
         }),
         Kind::Enum(enum_desc) => match config.enum_repr {
-            EnumRepr::Int32 => Some(FieldDecoder::EnumInt32 {
-                value: 0,
-                has_value: false,
-                has_presence,
+            EnumRepr::Int32 => direct(FieldDecoder::EnumInt32 {
+                default: enum_desc.default_value().number(),
                 builder: PrimitiveBuilder::with_capacity(capacity),
             }),
-            EnumRepr::String => Some(FieldDecoder::EnumString {
-                value: 0,
-                has_value: false,
-                has_presence,
-                builder: StringBuilderInner::new(config.use_large_string),
+            EnumRepr::String => direct(FieldDecoder::EnumString {
+                builder: StringColumn::with_capacity(config.use_large_string, capacity),
                 enum_names: EnumNames::new(&enum_desc),
             }),
-            EnumRepr::Binary => Some(FieldDecoder::EnumBinary {
-                value: 0,
-                has_value: false,
-                has_presence,
-                builder: BinaryBuilderInner::new(config.use_large_binary),
+            EnumRepr::Binary => direct(FieldDecoder::EnumBinary {
+                builder: ByteColumn::with_capacity(config.use_large_binary, capacity),
                 enum_names: EnumNames::new(&enum_desc),
             }),
         },
@@ -2726,97 +2387,76 @@ fn build_message_field_decoder(
     msg_desc: MessageDescriptor,
     config: &PtarsConfig,
     ancestors: &mut Vec<String>,
-) -> Option<FieldDecoder> {
+) -> Option<(FieldDecoder, FieldFlags)> {
+    let direct = |decoder| Some((decoder, FieldFlags::empty()));
+    let buffered = |decoder| Some((decoder, FieldFlags::BUFFERED));
     match msg_desc.full_name() {
-        "google.protobuf.Timestamp" => Some(FieldDecoder::Timestamp {
+        "google.protobuf.Timestamp" => buffered(FieldDecoder::Timestamp {
             seconds: 0,
             nanos: 0,
-            has_value: false,
             builder: PrimitiveBuilder::new(),
             unit: config.timestamp_unit.into(),
             tz: config.timestamp_tz.clone(),
         }),
-        "google.protobuf.Duration" => Some(FieldDecoder::Duration {
+        "google.protobuf.Duration" => buffered(FieldDecoder::Duration {
             seconds: 0,
             nanos: 0,
-            has_value: false,
             builder: PrimitiveBuilder::new(),
             unit: config.duration_unit.into(),
         }),
-        "google.type.Date" => Some(FieldDecoder::Date {
+        "google.type.Date" => buffered(FieldDecoder::Date {
             year: 0,
             month: 0,
             day: 0,
-            has_value: false,
             builder: PrimitiveBuilder::new(),
         }),
-        "google.type.TimeOfDay" => Some(FieldDecoder::TimeOfDay {
+        "google.type.TimeOfDay" => buffered(FieldDecoder::TimeOfDay {
             hours: 0,
             minutes: 0,
             seconds_val: 0,
             nanos: 0,
-            has_value: false,
             builder: PrimitiveBuilder::new(),
             unit: config.time_unit.into(),
         }),
-        "google.protobuf.DoubleValue" => Some(FieldDecoder::WrapperDouble {
-            value: 0.0,
-            has_value: false,
+        "google.protobuf.DoubleValue" => direct(FieldDecoder::WrapperDouble {
             builder: PrimitiveBuilder::new(),
         }),
-        "google.protobuf.FloatValue" => Some(FieldDecoder::WrapperFloat {
-            value: 0.0,
-            has_value: false,
+        "google.protobuf.FloatValue" => direct(FieldDecoder::WrapperFloat {
             builder: PrimitiveBuilder::new(),
         }),
-        "google.protobuf.Int64Value" => Some(FieldDecoder::WrapperInt64 {
-            value: 0,
-            has_value: false,
+        "google.protobuf.Int64Value" => direct(FieldDecoder::WrapperInt64 {
             builder: PrimitiveBuilder::new(),
         }),
-        "google.protobuf.UInt64Value" => Some(FieldDecoder::WrapperUInt64 {
-            value: 0,
-            has_value: false,
+        "google.protobuf.UInt64Value" => direct(FieldDecoder::WrapperUInt64 {
             builder: PrimitiveBuilder::new(),
         }),
-        "google.protobuf.Int32Value" => Some(FieldDecoder::WrapperInt32 {
-            value: 0,
-            has_value: false,
+        "google.protobuf.Int32Value" => direct(FieldDecoder::WrapperInt32 {
             builder: PrimitiveBuilder::new(),
         }),
-        "google.protobuf.UInt32Value" => Some(FieldDecoder::WrapperUInt32 {
-            value: 0,
-            has_value: false,
+        "google.protobuf.UInt32Value" => direct(FieldDecoder::WrapperUInt32 {
             builder: PrimitiveBuilder::new(),
         }),
-        "google.protobuf.BoolValue" => Some(FieldDecoder::WrapperBool {
+        "google.protobuf.BoolValue" => buffered(FieldDecoder::WrapperBool {
             value: false,
-            has_value: false,
             builder: BooleanBuilder::new(),
         }),
-        "google.protobuf.StringValue" => Some(FieldDecoder::WrapperString {
-            value: Vec::new(),
-            has_value: false,
-            builder: StringBuilderInner::new(config.use_large_string),
+        "google.protobuf.StringValue" => direct(FieldDecoder::WrapperString {
+            builder: StringColumn::with_capacity(config.use_large_string, 0),
         }),
-        "google.protobuf.BytesValue" => Some(FieldDecoder::WrapperBytes {
-            value: Vec::new(),
-            has_value: false,
-            builder: BinaryBuilderInner::new(config.use_large_binary),
+        "google.protobuf.BytesValue" => direct(FieldDecoder::WrapperBytes {
+            builder: ByteColumn::with_capacity(config.use_large_binary, 0),
         }),
         _ => {
             // Recursion guard: a message type already being built higher in the chain
             // decodes as its raw bytes (see MessageDecoder::new_inner).
             if ancestors.iter().any(|a| a == msg_desc.full_name()) {
-                return Some(FieldDecoder::Bytes {
-                    has_presence: true,
-                    builder: ByteColumn::new(config.use_large_binary),
+                return direct(FieldDecoder::Bytes {
+                    builder: ByteColumn::with_capacity(config.use_large_binary, 0),
                 });
             }
             let sub_decoder = MessageDecoder::new_inner(&msg_desc, config, 0, ancestors);
-            Some(FieldDecoder::Message {
-                sub_decoder,
-                has_value: false,
+            buffered(FieldDecoder::Message {
+                sub_decoder: Box::new(sub_decoder),
                 is_valid: BooleanBuilder::new(),
             })
         }
@@ -2904,7 +2544,7 @@ fn build_repeated_decoder(
     };
 
     Some(FieldDecoder::Repeated {
-        inner,
+        inner: Box::new(inner),
         offsets: offsets(),
         list_name: ln,
         list_nullable: lnb,
@@ -2978,7 +2618,7 @@ fn build_repeated_message_decoder(
     };
 
     Some(FieldDecoder::Repeated {
-        inner,
+        inner: Box::new(inner),
         offsets,
         list_name: ln,
         list_nullable: lnb,
@@ -2997,137 +2637,20 @@ fn build_map_decoder(
     let key_field = map_entry.get_field_by_name("key")?;
     let value_field = map_entry.get_field_by_name("value")?;
 
-    // Build singular decoders for key and value (they buffer per-entry, not per-row)
-    let key_decoder = build_singular_decoder_for_map(&key_field, config, ancestors)?;
-    let value_decoder = build_singular_decoder_for_map(&value_field, config, ancestors)?;
+    // One row per entry; the number of entries is unknown.
+    let (key_decoder, key_flags) = build_field_decoder(&key_field, config, 0, ancestors)?;
+    let (value_decoder, value_flags) = build_field_decoder(&value_field, config, 0, ancestors)?;
 
     Some(FieldDecoder::Map {
+        key_flags,
+        value_flags,
         key_decoder: Box::new(key_decoder),
         value_decoder: Box::new(value_decoder),
         offsets: vec![0],
+        row_entries: 0,
         map_value_name: config.map_value_name.clone(),
         map_value_nullable: config.map_value_nullable,
     })
-}
-
-/// Build a singular decoder for use inside a map entry (no presence tracking).
-fn build_singular_decoder_for_map(
-    field: &FieldDescriptor,
-    config: &PtarsConfig,
-    ancestors: &mut Vec<String>,
-) -> Option<FieldDecoder> {
-    // Map keys/values are never "optional" in protobuf sense — they use proto3 defaults
-    match field.kind() {
-        Kind::Int32 => Some(FieldDecoder::Int32 {
-            value: 0,
-            has_value: false,
-            has_presence: false,
-            builder: PrimitiveBuilder::new(),
-        }),
-        Kind::Int64 => Some(FieldDecoder::Int64 {
-            value: 0,
-            has_value: false,
-            has_presence: false,
-            builder: PrimitiveBuilder::new(),
-        }),
-        Kind::Uint32 => Some(FieldDecoder::UInt32 {
-            value: 0,
-            has_value: false,
-            has_presence: false,
-            builder: PrimitiveBuilder::new(),
-        }),
-        Kind::Uint64 => Some(FieldDecoder::UInt64 {
-            value: 0,
-            has_value: false,
-            has_presence: false,
-            builder: PrimitiveBuilder::new(),
-        }),
-        Kind::Sint32 => Some(FieldDecoder::Sint32 {
-            value: 0,
-            has_value: false,
-            has_presence: false,
-            builder: PrimitiveBuilder::new(),
-        }),
-        Kind::Sint64 => Some(FieldDecoder::Sint64 {
-            value: 0,
-            has_value: false,
-            has_presence: false,
-            builder: PrimitiveBuilder::new(),
-        }),
-        Kind::Sfixed32 => Some(FieldDecoder::Sfixed32 {
-            value: 0,
-            has_value: false,
-            has_presence: false,
-            builder: PrimitiveBuilder::new(),
-        }),
-        Kind::Sfixed64 => Some(FieldDecoder::Sfixed64 {
-            value: 0,
-            has_value: false,
-            has_presence: false,
-            builder: PrimitiveBuilder::new(),
-        }),
-        Kind::Fixed32 => Some(FieldDecoder::Fixed32 {
-            value: 0,
-            has_value: false,
-            has_presence: false,
-            builder: PrimitiveBuilder::new(),
-        }),
-        Kind::Fixed64 => Some(FieldDecoder::Fixed64 {
-            value: 0,
-            has_value: false,
-            has_presence: false,
-            builder: PrimitiveBuilder::new(),
-        }),
-        Kind::Float => Some(FieldDecoder::Float {
-            value: 0.0,
-            has_value: false,
-            has_presence: false,
-            builder: PrimitiveBuilder::new(),
-        }),
-        Kind::Double => Some(FieldDecoder::Double {
-            value: 0.0,
-            has_value: false,
-            has_presence: false,
-            builder: PrimitiveBuilder::new(),
-        }),
-        Kind::Bool => Some(FieldDecoder::Bool {
-            value: false,
-            has_value: false,
-            has_presence: false,
-            builder: BooleanBuilder::new(),
-        }),
-        Kind::String => Some(FieldDecoder::String {
-            has_presence: false,
-            builder: StringColumn::new(config.use_large_string),
-        }),
-        Kind::Bytes => Some(FieldDecoder::Bytes {
-            has_presence: false,
-            builder: ByteColumn::new(config.use_large_binary),
-        }),
-        Kind::Enum(enum_desc) => match config.enum_repr {
-            EnumRepr::Int32 => Some(FieldDecoder::EnumInt32 {
-                value: 0,
-                has_value: false,
-                has_presence: false,
-                builder: PrimitiveBuilder::new(),
-            }),
-            EnumRepr::String => Some(FieldDecoder::EnumString {
-                value: 0,
-                has_value: false,
-                has_presence: false,
-                builder: StringBuilderInner::new(config.use_large_string),
-                enum_names: EnumNames::new(&enum_desc),
-            }),
-            EnumRepr::Binary => Some(FieldDecoder::EnumBinary {
-                value: 0,
-                has_value: false,
-                has_presence: false,
-                builder: BinaryBuilderInner::new(config.use_large_binary),
-                enum_names: EnumNames::new(&enum_desc),
-            }),
-        },
-        Kind::Message(msg_desc) => build_message_field_decoder(msg_desc, config, ancestors),
-    }
 }
 
 // ---------------------------------------------------------------------------

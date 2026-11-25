@@ -252,6 +252,11 @@ ptars converts protobuf types to Arrow types as follows:
 | `repeated T`  | `list<T>`   |
 | `map<K, V>`   | `map<K, V>` |
 
+!!! note "Repeated map keys"
+    If one message encodes the same map key more than once (for example, two
+    serialized messages concatenated), every entry is kept, in wire order.
+    Protobuf parsers keep only the last one.
+
 ### Well-Known Types
 
 | Protobuf Type               | Arrow Type                                               | Notes                                            |
