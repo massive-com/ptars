@@ -5625,6 +5625,59 @@ mod tests {
         );
     }
 
+    /// A repeated TimeOfDay reads its fields as int32, like a singular one,
+    /// so hours outside int32 on the wire can't overflow i64.
+    #[test]
+    fn test_repeated_time_of_day_reads_int32_hours() {
+        let mut pool = create_time_of_day_pool();
+        let field = |name: &str, number, label: Label| FieldDescriptorProto {
+            name: Some(name.to_string()),
+            number: Some(number),
+            label: Some(label.into()),
+            r#type: Some(Type::Message.into()),
+            type_name: Some(".google.type.TimeOfDay".to_string()),
+            ..Default::default()
+        };
+        pool.add_file_descriptor_proto(FileDescriptorProto {
+            name: Some("test.proto".to_string()),
+            package: Some("test".to_string()),
+            syntax: Some("proto3".to_string()),
+            dependency: vec!["google/type/timeofday.proto".to_string()],
+            message_type: vec![DescriptorProto {
+                name: Some("WithTimeOfDay".to_string()),
+                field: vec![
+                    field("one", 1, Label::Optional),
+                    field("many", 2, Label::Repeated),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let descriptor = pool.get_message_by_name("test.WithTimeOfDay").unwrap();
+
+        let mut time_of_day = wire_tag(1, 0);
+        time_of_day.extend(wire_varint((1 << 62) + 5));
+        let mut row = Vec::new();
+        for field in [1, 2] {
+            row.extend(wire_tag(field, 2));
+            row.extend(wire_varint(time_of_day.len() as u64));
+            row.extend(&time_of_day);
+        }
+        let batch = binary_array_to_record_batch_direct(
+            &BinaryArray::from(vec![row.as_slice()]),
+            &descriptor,
+            &PtarsConfig::default(),
+        )
+        .unwrap();
+        let many = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .unwrap();
+        assert_eq!(batch.column(0).as_ref(), many.value(0).as_ref());
+    }
+
     fn wire_varint(mut v: u64) -> Vec<u8> {
         let mut out = Vec::new();
         loop {
@@ -6280,7 +6333,8 @@ mod tests {
             ..PtarsConfig::default()
         };
         let (_pool, map) = create_map_descriptor(Type::String, Type::Int32);
-        for config in [PtarsConfig::default(), large_lists] {
+        let strict = PtarsConfig::default().with_strict_wire_types(true);
+        for config in [PtarsConfig::default(), large_lists, strict] {
             for (descriptor, batches) in [
                 (
                     merge.clone(),
@@ -6302,6 +6356,70 @@ mod tests {
                     assert_eq!(reused.finish_batch(), fresh.finish());
                 }
             }
+        }
+    }
+
+    /// A proto3 message `test.{name}` with `fields`.
+    fn message_of(name: &str, fields: Vec<FieldDescriptorProto>) -> MessageDescriptor {
+        let file_descriptor = FileDescriptorProto {
+            name: Some(format!("{name}.proto")),
+            package: Some("test".to_string()),
+            syntax: Some("proto3".to_string()),
+            message_type: vec![DescriptorProto {
+                name: Some(name.to_string()),
+                field: fields,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        create_pool_with_message(file_descriptor)
+            .get_message_by_name(&format!("test.{name}"))
+            .unwrap()
+    }
+
+    /// With `strict_wire_types`, a known field with a wire type its type
+    /// can't use fails the message, as in prost; without it, the field is
+    /// skipped. Packed and unpacked repeated fields are both fine.
+    #[test]
+    fn test_strict_wire_types() {
+        let descriptor = message_of(
+            "Strict",
+            vec![
+                scalar_field("a", 1, Type::Int32),
+                FieldDescriptorProto {
+                    label: Some(Label::Repeated.into()),
+                    ..scalar_field("r", 2, Type::Int32)
+                },
+            ],
+        );
+        let decode = |strict: bool, message: &[u8]| {
+            let config = PtarsConfig::default().with_strict_wire_types(strict);
+            let mut decoder = MessageDecoder::new(&descriptor, &config);
+            let ok = decoder.decode_row(message).is_ok();
+            (ok, decoder.finish())
+        };
+        // a = 7 as a varint, r = [1, 2] packed, then r = 3 unpacked.
+        let valid = [0x08, 7, 0x12, 2, 1, 2, 0x10, 3];
+        // a sent length-delimited: 0x0a = field 1, wire type 2.
+        let mismatched = [0x0a, 1, 7];
+
+        assert_eq!(decode(true, &valid), (true, decode(false, &valid).1));
+        // Skipped, the field decodes as if absent.
+        assert_eq!(decode(false, &mismatched), (true, decode(false, &[]).1));
+        assert!(!decode(true, &mismatched).0);
+    }
+
+    /// A length prefix near `u64::MAX`, on a known or an unknown field, fails
+    /// the message instead of overflowing.
+    #[test]
+    fn test_huge_length_prefix_fails() {
+        let descriptor = message_of("Huge", vec![scalar_field("s", 1, Type::String)]);
+        let u64_max = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        // 0x0a = field 1 (s), wire type 2; 0x9a 0x06 = field 99, wire type 2.
+        for tag in [&[0x0a][..], &[0x9a, 0x06]] {
+            let message = [tag, &u64_max, b"abc"].concat();
+            let mut decoder = MessageDecoder::new(&descriptor, &PtarsConfig::default());
+            assert!(decoder.decode_row(&message).is_err(), "tag {tag:?}");
         }
     }
 }

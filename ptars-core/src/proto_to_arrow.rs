@@ -21,8 +21,10 @@ use prost_reflect::{EnumDescriptor, FieldDescriptor, Kind, MessageDescriptor};
 use crate::config::{ConfluentWirePolicy, EnumRepr, PtarsConfig};
 
 mod column_builder;
+mod wire_types;
 
 use column_builder::{validate_utf8, ByteColumn, StringColumn};
+use wire_types::WireTypes;
 
 // ---------------------------------------------------------------------------
 // Wire format decoding primitives
@@ -115,11 +117,7 @@ fn skip_field(wire_type: u8, buf: &[u8]) -> Result<usize, prost::DecodeError> {
         }
         2 => {
             let (len, n) = decode_varint(buf)?;
-            let total = n + len as usize;
-            if buf.len() < total {
-                return Err(decode_error("unexpected EOF"));
-            }
-            Ok(total)
+            Ok(n + check_length(buf, n, len)?)
         }
         5 => {
             if buf.len() < 4 {
@@ -155,12 +153,19 @@ fn skip_group(buf: &[u8]) -> Result<usize, prost::DecodeError> {
 /// Read a length-delimited field, returning (data_slice, bytes_consumed).
 fn read_length_delimited(buf: &[u8]) -> Result<(&[u8], usize), prost::DecodeError> {
     let (len, n) = decode_varint(buf)?;
-    let len = len as usize;
-    let total = n + len;
-    if buf.len() < total {
+    let total = n + check_length(buf, n, len)?;
+    Ok((&buf[n..total], total))
+}
+
+/// `len`, the length read after an `n`-byte prefix, if `buf` holds that many
+/// more bytes. Compares before adding, since a corrupt length near
+/// `u64::MAX` would overflow `n + len`.
+#[inline]
+fn check_length(buf: &[u8], n: usize, len: u64) -> Result<usize, prost::DecodeError> {
+    if len > (buf.len() - n) as u64 {
         return Err(decode_error("unexpected EOF"));
     }
-    Ok((&buf[n..total], total))
+    Ok(len as usize)
 }
 
 /// Strip the Confluent Schema Registry wire format prefix from a message.
@@ -729,7 +734,10 @@ impl RepeatedInner {
                 }
                 let (data, total) = read_length_delimited(buf)?;
                 let vals = decode_wkt_submessage(data, 4)?;
-                let total_seconds = vals[0] * 3600 + vals[1] * 60 + vals[2];
+                // int32 fields, as in the singular path: cannot overflow i64.
+                let total_seconds = i64::from(vals[0] as i32) * 3600
+                    + i64::from(vals[1] as i32) * 60
+                    + i64::from(vals[2] as i32);
                 values_builder.append_value(convert_seconds_nanos_to_unit(
                     total_seconds,
                     vals[3] as i32,
@@ -2113,6 +2121,8 @@ struct DecoderState {
     decoder: FieldDecoder,
     field: FieldDescriptor,
     flags: FieldFlags,
+    /// [`WireTypes::ALL`] unless [`PtarsConfig::strict_wire_types`].
+    wire_types: WireTypes,
 }
 
 /// Decodes serialized messages of one type into a record batch, one row per
@@ -2171,6 +2181,11 @@ impl MessageDecoder {
                 }
                 flags.set(FieldFlags::HAS_PRESENCE, field.supports_presence());
                 decoders.push(DecoderState {
+                    wire_types: if config.strict_wire_types {
+                        WireTypes::of(&field)
+                    } else {
+                        WireTypes::ALL
+                    },
                     decoder,
                     field,
                     flags,
@@ -2208,9 +2223,8 @@ impl MessageDecoder {
     /// An error still ends the row (`flush_row`), so the decoder stays
     /// usable; drop the failed rows to keep only valid messages.
     ///
-    /// Panics on a length prefix that overflows `usize`, a `google.type.Date`
-    /// that `NaiveDate::from_ymd_opt` rejects, or an overflow in
-    /// `convert_seconds_nanos_to_unit`.
+    /// Panics on a `google.type.Date` that `NaiveDate::from_ymd_opt`
+    /// rejects, or an overflow in `convert_seconds_nanos_to_unit`.
     pub fn decode_row(&mut self, buf: &[u8]) -> Result<(), prost::DecodeError> {
         let result = self.decode_fields(buf);
         self.flush_row();
@@ -2233,7 +2247,13 @@ impl MessageDecoder {
                 None
             };
             if let Some(idx) = idx {
-                let DecoderState { decoder, flags, .. } = &mut self.decoders[idx];
+                let DecoderState {
+                    decoder,
+                    flags,
+                    wire_types,
+                    ..
+                } = &mut self.decoders[idx];
+                wire_types.check(field_num, wire_type)?;
                 pos += decoder.decode(wire_type, &buf[pos..], flags)?;
             } else {
                 pos += skip_field(wire_type, &buf[pos..])?;

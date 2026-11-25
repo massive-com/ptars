@@ -163,6 +163,7 @@ fn bench_shape(
     encode: fn(&MessageDescriptor, usize) -> Vec<u8>,
 ) {
     let config = PtarsConfig::default();
+    let strict = PtarsConfig::default().with_strict_wire_types(true);
     let mut group = c.benchmark_group(name);
     for n in BATCH_SIZES {
         let owned: Vec<Vec<u8>> = (0..n).map(|i| encode(writer, i)).collect();
@@ -181,6 +182,17 @@ fn bench_shape(
                 decoder.finish()
             });
         });
+        group.bench_with_input(
+            BenchmarkId::new("decode_row_strict", n),
+            &messages,
+            |b, m| {
+                b.iter(|| {
+                    let mut decoder = MessageDecoder::with_capacity(descriptor, &strict, n);
+                    decode_rows(&mut decoder, m).unwrap();
+                    decoder.finish()
+                });
+            },
+        );
         group.bench_with_input(BenchmarkId::new("reuse", n), &messages, |b, m| {
             let mut decoder = MessageDecoder::with_capacity(descriptor, &config, n);
             b.iter(|| {
