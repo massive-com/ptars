@@ -181,6 +181,13 @@ fn bench_shape(
                 decoder.finish()
             });
         });
+        group.bench_with_input(BenchmarkId::new("reuse", n), &messages, |b, m| {
+            let mut decoder = MessageDecoder::with_capacity(descriptor, &config, n);
+            b.iter(|| {
+                decode_rows(&mut decoder, m).unwrap();
+                decoder.finish_batch()
+            });
+        });
         group.bench_with_input(BenchmarkId::new("build", n), &n, |b, &n| {
             b.iter(|| MessageDecoder::with_capacity(descriptor, &config, n));
         });
