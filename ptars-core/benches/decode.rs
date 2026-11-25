@@ -1,4 +1,6 @@
 //! Decoding protobuf messages to an Arrow `RecordBatch`.
+//!
+//! `build` and `build_finish` measure the fixed cost of a batch.
 
 use arrow_array::BinaryArray;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -6,7 +8,7 @@ use prost::Message;
 use prost_reflect::prost_types::field_descriptor_proto::{Label, Type};
 use prost_reflect::prost_types::{DescriptorProto, FieldDescriptorProto, FileDescriptorProto};
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor, Value};
-use ptars_core::{binary_array_to_record_batch_direct, PtarsConfig};
+use ptars_core::{binary_array_to_record_batch_direct, MessageDecoder, PtarsConfig};
 
 const BATCH_SIZES: [usize; 4] = [1, 64, 1024, 8192];
 
@@ -146,6 +148,13 @@ fn nested(descriptor: &MessageDescriptor, i: usize) -> Vec<u8> {
     m.encode_to_vec()
 }
 
+fn decode_rows(decoder: &mut MessageDecoder, messages: &[&[u8]]) -> Result<(), prost::DecodeError> {
+    for message in messages {
+        decoder.decode_row(message)?;
+    }
+    Ok(())
+}
+
 fn bench_shape(
     c: &mut Criterion,
     name: &str,
@@ -157,12 +166,26 @@ fn bench_shape(
     let mut group = c.benchmark_group(name);
     for n in BATCH_SIZES {
         let owned: Vec<Vec<u8>> = (0..n).map(|i| encode(writer, i)).collect();
+        let messages: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
         let binary = BinaryArray::from_iter_values(&owned);
         let bytes: usize = owned.iter().map(Vec::len).sum();
         group.throughput(Throughput::Bytes(bytes as u64));
 
         group.bench_with_input(BenchmarkId::new("direct", n), &binary, |b, binary| {
             b.iter(|| binary_array_to_record_batch_direct(binary, descriptor, &config).unwrap());
+        });
+        group.bench_with_input(BenchmarkId::new("decode_row", n), &messages, |b, m| {
+            b.iter(|| {
+                let mut decoder = MessageDecoder::with_capacity(descriptor, &config, n);
+                decode_rows(&mut decoder, m).unwrap();
+                decoder.finish()
+            });
+        });
+        group.bench_with_input(BenchmarkId::new("build", n), &n, |b, &n| {
+            b.iter(|| MessageDecoder::with_capacity(descriptor, &config, n));
+        });
+        group.bench_with_input(BenchmarkId::new("build_finish", n), &n, |b, &n| {
+            b.iter(|| MessageDecoder::with_capacity(descriptor, &config, n).finish());
         });
     }
     group.finish();
